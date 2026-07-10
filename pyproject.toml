@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coastal"
+version = "0.1.0"
+description = "Cell segmentation via optical flow metrics and learned embeddings"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "GPL-3.0-or-later"}
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "torch",
+    "scikit-image",
+    "scikit-learn",
+    "scipy",
+    "joblib",
+    "matplotlib",
+    "tqdm",
+    "hmmlearn",
+    "shapely",
+    "cma",
+    "pandas",
+    "pillow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "flake8",
+]
+# Notebook glue only — the coastal/ package itself stays array-only (no cecelia/zarr/btrack
+# imports). The demo notebooks additionally need:
+#   - btrack           (tracking; pip-installable, listed below)
+#   - the cecelia IO helpers, installed separately as an editable path dep — NOT a PyPI package:
+#         pip install -e <cecelia-pineapple>/python      # import name `cecelia`
+notebooks = [
+    "btrack",
+]
+
+[tool.setuptools]
+packages = ["coastal"]

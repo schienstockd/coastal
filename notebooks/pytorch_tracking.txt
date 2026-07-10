@@ -1,0 +1,9 @@
+My pipeline was roughly the following:
+
+✅ Train PyTorch model to minimize color switches across many confetti videos
+✅ Learn T cell "instinct" (movement patterns specific to T cells)
+✅ Freeze the model once color switch rate plateaus
+✅ Users tune ABM hyperparameters for their experimental conditions
+✅ Iterate by collecting more confetti videos in different conditions
+
+Now.. the pytorch model to train transitions will include morphology + HMM morphology states along cell boundary + movement. I know it's not what they call "embedding" - not even sure what they mean by embedding - but the pytorch model will take shape into account as well as movement. Is that so different from their embedding?

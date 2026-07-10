@@ -1,15 +1,24 @@
-# Coastal
+# 🚧 Coastal
+
+[![CI](https://github.com/schienstockd/coastal/actions/workflows/ci.yml/badge.svg)](https://github.com/schienstockd/coastal/actions/workflows/ci.yml)
+[![License: GPL v3+](https://img.shields.io/badge/License-GPLv3+-blue.svg)](LICENSE)
+
+> 🚧 **Work in progress — this package does not work yet.** The methods here are research
+> *principles still being developed and validated*, not a finished or installable tool. Expect
+> incomplete paths, rough edges, and breaking changes, and note that **nothing here has been
+> independently verified**. This repository is public for **transparency and to keep the work
+> organised** — not for use. How it was built: [end of this README](#how-this-was-built).
 
 **Instance segmentation of cells in 2D/3D microscopy — trained on optical-flow structure, no
 ground-truth labels required.** Plus a cell-tracking module for 3D+T confetti fluorescent
 microscopy.
 
-Coastal learns to separate cells from the *motion* in a movie rather than from hand-drawn masks.
-A UNet is trained on multi-scale optical-flow metrics with two self-supervised losses, producing
-a probability map and per-pixel embeddings that a two-pass region-grower turns into instance
-labels. Those labels then feed a Kalman + LAP tracker.
-
-> Research code, `v0.1.0`. APIs may change. See [`docs/`](docs/) for the full reference.
+The idea: separate cells from the *motion* in a movie rather than from hand-drawn masks. A UNet is
+trained on multi-scale optical-flow metrics with two self-supervised losses, producing a
+probability map and per-pixel embeddings that a two-pass region-grower turns into instance labels;
+those labels then feed a Kalman + LAP tracker. Whether this *works* well enough to be useful is
+exactly what's still being tested — see [`docs/TRACKING.md`](docs/TRACKING.md) for how open the
+tracking side still is.
 
 ## Why it's built this way
 
@@ -55,6 +64,10 @@ Requires Python ≥ 3.9. GPU is optional (CUDA → Apple MPS → CPU auto-select
 flow runs on CPU by design (no CUDA-OpenCV dependency).
 
 ## Quickstart
+
+*The intended interface — shown for transparency. It is **not** guaranteed to run end-to-end today
+(see the banner above); treat it as the shape the API is converging on, verified against the real
+function signatures.*
 
 ### Segmentation
 
@@ -137,14 +150,43 @@ coastal/
 
 ## Status & scope
 
-Actively developed research code aimed at 3D+T confetti T-cell microscopy (~800 cells/frame,
-61 frames, 5 movies). The segmentation path is the mature part; tracking is an open research
-problem — no method yet beats both `continuity` and `switch_rate` simultaneously
-(see [`docs/TRACKING.md`](docs/TRACKING.md)).
+**Work in progress — not a working tool.** This is a research exploration aimed at 3D+T confetti
+T-cell microscopy (~800 cells/frame, 61 frames, 5 movies). Its *principles* are still being tested:
 
-Coastal is a standalone Python package. It's designed to slot into the **cecelia**
-image-analysis pipeline at the array boundary (normalised frames in, label volume out); a
-possible Julia port is assessed — and deferred — in [`docs/JULIA_PORT.md`](docs/JULIA_PORT.md).
+- The **segmentation** idea (flow-metric-trained UNet, no labels) is the more developed part but
+  is not validated as a general tool.
+- **Tracking** is an open research problem — no method yet beats both `continuity` and
+  `switch_rate` simultaneously (see [`docs/TRACKING.md`](docs/TRACKING.md)).
+
+The repo exists for **transparency and organisation**, not for others to install and run. It's a
+standalone Python package designed to eventually slot into the **cecelia** image-analysis pipeline
+at the array boundary (normalised frames in, label volume out); a possible Julia port is assessed —
+and deferred — in [`docs/JULIA_PORT.md`](docs/JULIA_PORT.md).
+
+## How this was built
+
+**The research is Dominik's; the repository engineering was done with [Claude Code](https://claude.com/claude-code)
+(Anthropic, Claude Opus 4.8), under his direction.** This split is different from a full
+"AI wrote the software" project — worth stating plainly:
+
+- **Dominik** owns the science: the segmentation/tracking *approach* (flow-as-supervision, learned
+  embeddings, the confetti tracking problem), the model and pipeline code, the experiments, and all
+  empirical judgement about what works. The core `coastal/` source and the research in the
+  notebooks predate and sit outside the AI collaboration.
+- **Claude Code** acted as an **engineer/librarian over that existing work**, not as its author. In
+  these sessions it: structured the documentation (the `CLAUDE.md` index + `docs/` skeleton, `FAQ`,
+  lifecycle trackers), wrote the first automated test suite (and surfaced a real behavioural quirk
+  in the label-stitching while doing so), produced the Julia-portability assessment, did the
+  cecelia integration/tooling (notebook data-loading, the packaging plan), and set up this
+  repository (git, CI, conventions).
+- **Not validated by the AI.** Claude's environment has no GPU, no PyTorch/OpenCV runtime, and no
+  microscopy data, so it **could not run the package, train a model, or validate segmentation or
+  tracking quality**. Everything empirical was — and must be — checked by Dominik. This is also why
+  the package is marked not-yet-working above.
+
+Scientific tools this pipeline builds on (each with its own license/citation): **PyTorch**,
+**OpenCV** (Farneback optical flow), **scikit-image**, **scipy**, **btrack** (used from the
+tracking notebooks for comparison), and the **cecelia** ecosystem it integrates with.
 
 ## License
 

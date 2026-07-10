@@ -41,6 +41,8 @@ See also:
 - [`docs/FUTURE.md`](docs/FUTURE.md) — deliberately deferred ideas: what / why deferred / when
   to revisit.
 - [`docs/todo/README.md`](docs/todo/README.md) — the parked-plan convention (`*_PLAN.md`).
+- [`docs/DEV.md`](docs/DEV.md) — development workflow: branches, commits, PRs, CI, and the
+  never-push-to-`main` + ask-before-every-commit + reservations-first rules.
 
 **Keep the docs current — update the relevant file in the same change, not after.**
 
@@ -55,6 +57,7 @@ See also:
 | Julia-portability status of any component | `docs/JULIA_PORT.md` |
 | Deferring a known-better approach | `docs/FUTURE.md` |
 | A decision becomes *surprising* to an outside reader | `FAQ.md` (one punchy Q&A; keep detail in `docs/`) |
+| Branching, commits, PRs, CI (dev workflow) | `docs/DEV.md` |
 
 ## Cross-cutting rules
 
@@ -73,6 +76,11 @@ See also:
   CPU by design.
 - **No ground-truth labels in the segmentation path.** The whole point is flow-guided training;
   do not add a code path that silently assumes GT masks exist.
+- **Git: never commit or push to `main` — branch + PR.** Ask before every commit and push
+  (explicitly, each time; a "do the work" yes is not a commit/push yes), and volunteer honest
+  reservations first. `gh` isn't installed → push the branch and relay the PR-create URL + a
+  paste-ready body. Note this package **cannot be run in this environment** (no torch/GPU/data), so
+  most changes are unverified end-to-end — say so. Full workflow: `docs/DEV.md`.
 
 ## Running
 

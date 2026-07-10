@@ -35,3 +35,21 @@ Adopted cecelia's Claude documentation skeleton:
   path; added a `notebooks` extra (`btrack`); documented the `pip install -e <cecelia>/python`
   dev-link step in `docs/DATA.md`.
 - Relicensed to GPL-3.0-or-later (matches cecelia).
+
+## 2026-07-10 — Public repo + standards
+Set up `github.com/schienstockd/coastal` and the contribution standards:
+- Initialised the git repo and pushed to GitHub (initial commit was the agreed last direct-to-`main`
+  push; everything since lands via feature branch + PR).
+- Added CI (`.github/workflows/ci.yml`): Ubuntu, CPU-only torch + OpenCV system libs, `pip install
+  -e .[dev]` → `pytest`. First run on merged `main` is **green** — the package's first real
+  end-to-end execution (Claude's env has no torch/GPU/data).
+- Documented the dev workflow in `docs/DEV.md`: never commit/push to `main`, feature-branch + PR,
+  conventional commits with the `Co-Authored-By` trailer, and the agent rules (ask before every
+  commit/push, state reservations first, `gh` absent → relay the PR URL + paste-ready body).
+  Added the `docs/DEV.md` pointer + routing row + git cross-cutting rule to `CLAUDE.md`.
+- Reframed `README.md` for a public research repo: 🚧 WIP banner (principles still being validated,
+  not a working tool; here for transparency/organisation) and a "How this was built" section
+  attributing the science to Dominik and the doc/test/tooling/repo engineering to Claude Code —
+  explicitly noting Claude could not run or validate the package.
+- Applied cecelia's TODO policy: `docs/TODO.md` tracks **open work only** (items deleted when done);
+  the shipped `## Fixed` history moved to this ledger + git.

@@ -13,6 +13,9 @@ venv/
 env/
 .env
 
+# pixi (env dir is machine-specific and huge; pixi.lock IS committed for reproducibility)
+.pixi/
+
 # Jupyter
 .ipynb_checkpoints/
 

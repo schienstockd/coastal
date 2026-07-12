@@ -84,9 +84,21 @@ See also:
 
 ## Running
 
+Recommended — the self-contained **pixi** env (independent of any external conda env; also links
+cecelia editable). See `docs/DATA.md` → *Independent dev environment (pixi)*:
+
 ```bash
-pip install -e .
-pytest                                          # tests (needs the package installed)
+pixi install                # build the env (Python 3.12, coastal + cecelia editable, Jupyter)
+pixi run kernel             # register the "Python (coastal)" Jupyter kernel (once)
+pixi run test               # pytest
+pixi run lab                # JupyterLab rooted at notebooks/
+```
+
+Plain-pip fallback (what CI uses; run `scripts/link_cecelia.sh` for the notebooks' cecelia dep):
+
+```bash
+pip install -e .[dev]
+pytest
 jupyter notebook notebooks/tracking.ipynb       # tracking work
 jupyter notebook notebooks/optical_flow.ipynb   # segmentation work
 ```

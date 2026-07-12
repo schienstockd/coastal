@@ -63,10 +63,16 @@ itself the go-ahead to commit + push, so don't stall on extra `git status` round
 volunteer your honest reservations about the change**, in the same turn, before running the commit.
 A short, prioritized list separating:
 
-- **Unverified — "go look":** what you did *not* actually exercise. The dominant one for coastal:
-  Claude's environment has **no torch / GPU / microscopy data**, so the package can't be imported
-  or run here — tests are verified by logic-tracing or with stubbed deps, models are never trained,
-  segmentation/tracking never run on real images. CI (or Dominik) is the first real execution.
+- **Unverified — "go look":** what you did *not* actually exercise. What "unverified" means depends
+  on where the agent is running:
+  - *In a bare sandbox* (no torch/GPU/data): the package can't be imported or run at all — tests are
+    reasoned through or stubbed, and CI (or Dominik) is the first real execution.
+  - *In Dominik's workspace* (pixi + GPU available, as verified 2026-07-13): the agent **can**
+    `pixi install`, `pixi run test`, and `pixi run doctor` — so import, the GPU torch build, `cv2`,
+    the editable cecelia link, and the `tests/` suite are genuinely exercised. Say so when you did.
+  - **Still unverified either way:** anything needing **real microscopy data** — models are never
+    trained, and segmentation/tracking *quality* is never run on real images. That empirical
+    judgement remains Dominik's.
 - **Real limitations:** edge cases not handled, silent no-ops, perf, stale-state paths.
 
 If any reservation is material, pause for Dominik's call; if there are genuinely none, say
@@ -96,11 +102,20 @@ git push -u origin <type>/<slug>
 ## CI
 
 Every push / PR runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) on Ubuntu:
-`pip install -e .[dev]` (CPU-only torch, plus the OpenCV system libs) → `pytest`. It verifies the
-package imports and the `tests/` suite is green. Keep it green before requesting a merge.
+`pip install -e .[dev]` (CPU-only torch, plus the OpenCV system libs via apt) → `pytest`. It
+verifies the package imports and the `tests/` suite is green. Keep it green before requesting a
+merge. CI deliberately tests the **plain-pip** install path (not pixi), so a fresh `pip install -e .`
+stays viable for anyone without pixi; the local dev env uses pixi (below).
 
 ## Tests
 
-One `pytest` suite under [`tests/`](../tests) (needs the package installed — `pip install -e .`).
-Any change to core functionality ships with a test in the same change; see
-[`tests/README.md`](../tests/README.md) for scope and conventions.
+One `pytest` suite under [`tests/`](../tests). Run it via the dev env — `pixi run test` — or, in a
+plain-pip env, `pip install -e .[dev] && pytest`. Any change to core functionality ships with a test
+in the same change; see [`tests/README.md`](../tests/README.md) for scope and conventions.
+
+## Local dev environment
+
+`pixi.toml` defines a self-contained env (Python 3.12 + coastal editable + editable cecelia +
+Jupyter), independent of any external conda env: `pixi install`, then `pixi run kernel` / `lab` /
+`test` / `doctor`. Details in [`docs/DATA.md`](DATA.md) → *Independent dev environment (pixi)*.
+`pixi.lock` is committed; `.pixi/` is git-ignored.

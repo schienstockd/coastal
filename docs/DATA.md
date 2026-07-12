@@ -73,6 +73,30 @@ bootstrap is gone. cecelia's packaging design is recorded in
 shipping in the wheel — is fixed: cecelia now declares it as package-data, so the
 `importlib.resources` lookup above resolves for both wheel and editable installs.)
 
+### Independent dev environment (pixi)
+
+The notebooks used to run in a shared miniconda `r-cecelia-env`. They now have a **self-contained
+pixi environment** (`pixi.toml`) so coastal is independent of any external conda env. pixi pulls a
+pinned Python + conda-level bits from conda-forge and uses uv underneath for the PyPI resolve; it's
+the same tool cecelia uses, so one workflow spans both repos.
+
+```bash
+pixi install        # build .pixi/ : Python 3.12, coastal (editable, +dev +notebooks extras),
+                    #                and cecelia (editable, from the sibling checkout)
+pixi run kernel     # register the "Python (coastal)" Jupyter kernel (select it in each notebook)
+pixi run lab        # JupyterLab rooted at notebooks/
+pixi run test       # pytest
+pixi run doctor     # prints torch/cuda + cv2 + cecelia import — a quick "did the stack resolve" check
+```
+
+`pyproject.toml` stays the single source of truth for coastal's Python deps; `pixi.toml` only adds
+what pip can't (pinned Python, the editable **cecelia** link, the Jupyter stack). The editable
+cecelia line packages `scripts/link_cecelia.sh`'s job into the env declaratively — `pixi install`
+links cecelia and keeps it linked across re-solves. Non-pixi users (plain venv / uv) still run
+`scripts/link_cecelia.sh`; a non-sibling cecelia checkout means editing the path in `pixi.toml` (or
+`CECELIA_PYTHON=... scripts/link_cecelia.sh` outside pixi). `.pixi/` is git-ignored; `pixi.lock` is
+committed for reproducibility.
+
 ### Installing / keeping cecelia in sync
 
 cecelia isn't on PyPI yet, so today it's a local install. Three modes, from best-for-co-dev to

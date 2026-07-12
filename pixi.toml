@@ -1,0 +1,63 @@
+# Coastal — development environment (pixi).
+#
+# WHY pixi (not a bare venv / uv): coastal's runtime needs two things pip alone can't give you
+# portably — system libraries for `opencv-python` (libGL / glib), and a pinned Python — so pixi
+# pulls those from conda-forge while still using uv underneath for the PyPI resolve. It also matches
+# cecelia's tooling (cecelia-pineapple/pixi.toml), which coastal links against; one tool across both
+# repos. See docs/DATA.md → "Independent dev environment (pixi)".
+#
+# SOURCE-OF-TRUTH SPLIT (mirrors cecelia's Decision 2): coastal's Python deps live in
+# pyproject.toml — this file does NOT re-list them. Installing coastal editable with its extras
+# pulls torch / opencv / btrack / pytest etc. transitively from pyproject. pixi only adds what
+# pyproject can't: the conda-level system libs + Python, the editable cecelia link (an *environment*
+# concern, never a coastal package dep — the coastal/ source must not import cecelia), and Jupyter.
+#
+# Run everything via `pixi run <task>`. First-time setup:
+#     pixi install          # build the env (Python, system libs, coastal + deps, cecelia editable)
+#     pixi run kernel        # register the "coastal" Jupyter kernel (replaces the old r-cecelia-env)
+#     pixi run lab           # launch JupyterLab against notebooks/
+
+[workspace]
+name = "coastal"
+license = "GPL-3.0-or-later"
+channels = ["conda-forge"]
+platforms = ["linux-64", "win-64", "osx-arm64"]
+
+[dependencies]
+# conda-forge only for things pip can't provide portably.
+python = "3.12.*"
+# cvxopt is a btrack dependency with no macOS-arm64 PyPI wheel (a PyPI-only solve would build it from
+# source and fail on missing SuiteSparse headers). Pin it from conda-forge, prebuilt on every
+# platform, so `pixi install` never compiles it. Rationale mirrors cecelia-pineapple/pixi.toml.
+cvxopt = ">=1.3.1"
+
+# NOTE on opencv's system libs (libGL.so.1 / libglib-2.0): opencv-python dlopens these at import.
+# We do NOT pin them from conda-forge — `libgl` has no macOS candidate and, on Linux, the GPU
+# driver already provides libGL system-wide (matches cecelia's pixi.toml, which also omits them).
+# If `pixi run doctor` fails on `import cv2` with a missing .so, add the lib under
+# [target.linux-64.dependencies] rather than globally. CI installs them via apt (see ci.yml).
+
+[pypi-dependencies]
+# coastal itself, editable, WITH its dev + notebook extras — this is what drags in torch, opencv,
+# scikit-image, btrack, pytest, jupyter glue, … all pinned in pyproject.toml (the single source).
+coastal = { path = ".", editable = true, extras = ["dev", "notebooks"] }
+# cecelia's light IO helpers (zarr/OME/dim utils + the vendored btrack cell_config.json), editable
+# from the sibling checkout. This packages `scripts/link_cecelia.sh` into the env declaratively:
+# `pixi install` links it and keeps it linked across re-solves (a manual `pip install -e` would get
+# pruned on the next solve). Non-sibling checkout? Point CECELIA_PYTHON + run scripts/link_cecelia.sh
+# in a plain venv, or edit this path. cecelia is NOT in pyproject.toml on purpose (notebook glue).
+cecelia = { path = "../cecelia/cecelia-pineapple/python", editable = true }
+# Notebook runtime (the coastal[notebooks] extra carries btrack, not the Jupyter stack itself).
+jupyterlab = "*"
+ipykernel = "*"
+
+[tasks]
+# Register a dedicated Jupyter kernel so the notebooks run in THIS env, not the old miniconda
+# r-cecelia-env. Select "Python (coastal)" as the kernel in each notebook.
+kernel = "python -m ipykernel install --user --name coastal --display-name 'Python (coastal)'"
+# One-shot first-run convenience: kernel registration (env itself is already built by `pixi install`).
+setup = { depends-on = ["kernel"] }
+test = "pytest -q"
+lab = "jupyter lab --notebook-dir=notebooks"
+# Sanity check the heavy stack resolved and the GPU is visible.
+doctor = "python -c \"import torch, cv2, cecelia.utils.zarr_utils as z; print('torch', torch.__version__, 'cuda', torch.cuda.is_available()); print('cv2', cv2.__version__); print('cecelia ok')\""

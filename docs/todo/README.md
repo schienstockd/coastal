@@ -38,5 +38,10 @@ If it fits in a paragraph and needs no design, it's a `docs/TODO.md` item, not a
 
 ## Current parked plans
 
-_(none yet)_ — the Julia port lives as an assessment in `docs/JULIA_PORT.md`; promote it to a
-`JULIA_PORT_PLAN.md` here if/when a concrete build is scheduled.
+- [`CECELIA_NAPARI_UPSTREAM_PLAN.md`](CECELIA_NAPARI_UPSTREAM_PLAN.md) — extract coastal's napari
+  viz helpers (`coastal/napari_viz.py`) into a generic `cecelia/utils/napari_utils.py` and have
+  cecelia's `napari_bridge.py` delegate to it. **Work happens in the cecelia repo** — hand this
+  file to a cecelia session (see its *Handoff*). Paused until cecelia's `feat/umap-facet` lands.
+
+The Julia port lives as an assessment in `docs/JULIA_PORT.md`; promote it to a `JULIA_PORT_PLAN.md`
+here if/when a concrete build is scheduled.

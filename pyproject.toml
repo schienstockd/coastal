@@ -11,7 +11,11 @@ requires-python = ">=3.9"
 license = {text = "GPL-3.0-or-later"}
 dependencies = [
     "numpy",
-    "opencv-python",
+    # headless build: coastal uses cv2 for optical flow only (no imshow/GUI). The GUI build
+    # (opencv-python) bundles its own Qt5 plugins AND sets QT_QPA_PLATFORM_PLUGIN_PATH to them on
+    # import, which is ABI-incompatible with napari's PyQt5 xcb plugin → segfaults the kernel when a
+    # viewer opens. headless avoids that entirely. (napari_viz also guards against a stray GUI build.)
+    "opencv-python-headless",
     "torch",
     "scikit-image",
     "scikit-learn",

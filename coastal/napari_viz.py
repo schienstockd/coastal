@@ -19,11 +19,28 @@ Each ``show_*`` helper returns the napari ``Viewer`` (creating one if none is pa
 be layered into a single viewer.
 """
 
+import os
+
 import numpy as np
 
 # Default per-channel colormaps (extend if a movie has > 4 channels). Mirrors
 # cecelia.utils.napari_utils.CHANNEL_COLORMAPS — kept here as coastal's own choice of channel order.
 CHANNEL_COLORMAPS = ['red', 'green', 'blue', 'yellow']
+
+
+def _fix_qt_plugin_path():
+    """Drop a cv2-injected Qt plugin path before napari initialises Qt.
+
+    The GUI ``opencv-python`` build sets ``QT_QPA_PLATFORM_PLUGIN_PATH`` to its OWN bundled Qt5
+    plugins on ``import cv2``. Those are ABI-incompatible with napari's PyQt5, so loading the ``xcb``
+    platform plugin segfaults the kernel the moment a viewer opens. coastal imports cv2 (for flow)
+    before napari, so it inherits that poisoned path. If the var points into a cv2 install, remove it
+    so Qt falls back to PyQt5's own (compatible) plugins. Idempotent; must run before ``new_viewer``.
+    The permanent fix is the ``opencv-python-headless`` dependency (see pyproject); this guards a
+    stray GUI build too.
+    """
+    if 'cv2' in os.environ.get('QT_QPA_PLATFORM_PLUGIN_PATH', ''):
+        os.environ.pop('QT_QPA_PLATFORM_PLUGIN_PATH', None)
 
 
 def _scale_tzyx(pix_res):
@@ -32,8 +49,14 @@ def _scale_tzyx(pix_res):
 
 
 def _prep_image(image, ch_indices):
-    """Return (data, channel_axis) for napari from a [T,C,Z,Y,X] or [T,Z,Y,X] array."""
-    vol = np.asarray(image)
+    """Return (data, channel_axis) for napari from a [T,C,Z,Y,X] or [T,Z,Y,X] array.
+
+    The array is passed through WITHOUT materialising: a dask array stays lazy so napari loads only
+    the slices it displays. A confetti movie is multiple GB per channel — ``np.asarray`` here would
+    force the whole thing into RAM (and killed the kernel in pipeline_consensus). Channel selection
+    (``vol[:, list(ch_indices)]``) is a lazy index on dask, a cheap view on numpy.
+    """
+    vol = image
     if vol.ndim == 5:                       # [T, C, Z, Y, X]
         if ch_indices is not None:
             vol = vol[:, list(ch_indices)]
@@ -55,6 +78,7 @@ def show_images(image, pix_res, ch_indices=None, channel_names=None, viewer=None
 
     Returns the napari.Viewer.
     """
+    _fix_qt_plugin_path()
     from cecelia.utils import napari_utils
     v = viewer if viewer is not None else napari_utils.new_viewer()
     data, channel_axis = _prep_image(image, ch_indices)
@@ -72,6 +96,7 @@ def show_segmentation(image, instances, pix_res, ch_indices=None, channel_names=
 
     ``instances`` is a [T, Z, Y, X] integer label array (0 = background).
     """
+    _fix_qt_plugin_path()
     from cecelia.utils import napari_utils
     v = show_images(image, pix_res, ch_indices=ch_indices, channel_names=channel_names, viewer=viewer)
     napari_utils.add_labels(v, np.asarray(instances), scale=_scale_tzyx(pix_res), name='segmentation')
@@ -110,6 +135,7 @@ def show_tracks(tracks, pix_res, instances=None, image=None, ch_indices=None,
 
     Returns the napari.Viewer.
     """
+    _fix_qt_plugin_path()
     from cecelia.utils import napari_utils
     v = viewer
     if image is not None:

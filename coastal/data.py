@@ -180,6 +180,6 @@ if __name__ == "__main__":
         num_epochs=50,
         batch_size=2,
         seed=42,
-        device='cuda'
+        device=None,   # None/'auto' → cuda→mps→cpu
     )
     """)

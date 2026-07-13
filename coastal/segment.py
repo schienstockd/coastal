@@ -13,6 +13,8 @@ from scipy import ndimage
 from scipy.ndimage import binary_dilation, gaussian_filter, maximum_filter, distance_transform_edt
 from skimage.measure import regionprops
 
+from coastal.device import resolve_device
+
 from coastal.utils import match_masks_3d
 
 
@@ -109,7 +111,7 @@ class LearnedAffinityInference:
     ═══════════════════════════════════════════════════════════════════════════════
     """
 
-    def __init__(self, model, device='cuda',
+    def __init__(self, model, device=None,
                  affinity_threshold=0.5,
                  merge_affinity_threshold=0.65,
                  merge_max_distance=1.5,
@@ -188,9 +190,10 @@ class LearnedAffinityInference:
             min_component_size: discard fragments < this size [5–50]
                 Larger → more aggressive filtering of noise. Default: 20
         """
+        device = resolve_device(device)
         self.model = model.to(device).eval()
         self.device = device
-        
+
         # Core tuning (4)
         self.affinity_threshold = affinity_threshold
         self.merge_affinity_threshold = merge_affinity_threshold
@@ -623,7 +626,7 @@ class TwoPassSegmentationInference:
     Both passes use dual-criteria merging (affinity + intensity continuity).
     """
 
-    def __init__(self, model, device='cuda',
+    def __init__(self, model, device=None,
                  prob_threshold=0.3,
                  seed_size_large=24,
                  affinity_threshold_large=0.7,
@@ -673,6 +676,7 @@ class TwoPassSegmentationInference:
             min_component_size: minimum component size to keep
             min_boundary_pixels: minimum contact pixels required (default 1)
         """
+        device = resolve_device(device)
         self.model = model
         self.device = device
         self.prob_threshold = prob_threshold
@@ -812,13 +816,14 @@ class Inference3D:
     3. Return 3D instance map with consistent labels
     """
 
-    def __init__(self, model, device='cuda', **inference_kwargs):
+    def __init__(self, model, device=None, **inference_kwargs):
         """
         Args:
             model: trained UNet model
-            device: cuda or cpu
+            device: torch device; None/'auto' → cuda→mps→cpu (see coastal.device.resolve_device)
             **inference_kwargs: passed to LearnedAffinityInference
         """
+        device = resolve_device(device)
         self.model = model
         self.device = device
         self.inferencer_2d = LearnedAffinityInference(model, device=device, **inference_kwargs)

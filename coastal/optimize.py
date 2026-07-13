@@ -140,7 +140,7 @@ def optimize_segmentation_cma(
     purity_threshold=0.7,
     count_penalty_weight=0.0,
     fixed_params=None,
-    device='cuda',
+    device=None,
 ):
     """
     CMA-ES optimization of LearnedAffinityInference parameters.
@@ -165,7 +165,7 @@ def optimize_segmentation_cma(
         min_cell_size:    pixel threshold for "fragmented" label (default 100)
         purity_threshold: dominant-channel fraction to call a large cell "good" (default 0.7)
         fixed_params:     additional LearnedAffinityInference kwargs held fixed
-        device:           'cuda' or 'cpu'
+        device:           torch device; None/'auto' → cuda→mps→cpu (resolved by the inferencer)
 
     Returns:
         best_params:  dict of best parameters found (pass directly to LearnedAffinityInference)

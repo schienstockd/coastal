@@ -65,7 +65,7 @@ def visualize_frame_segmentation(frame, prob_map, instances, props,
     return fig
 
 
-def tune_inference_params_multi_frame(model, frames, metrics, param_grid, max_frames=None, device='cuda'):
+def tune_inference_params_multi_frame(model, frames, metrics, param_grid, max_frames=None, device=None):
     """Test parameter grid on multiple frames and return results."""
     from coastal.segment import TwoPassSegmentationInference
 

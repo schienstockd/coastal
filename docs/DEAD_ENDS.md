@@ -8,10 +8,9 @@ be **revived and formally ruled out** rather than silently re-tried.
 The code is not lost: git history holds every removed approach. Each entry names **what it was**,
 **why it was dropped**, **where to revive it from**, and **what "ruling it out" would now require**.
 
-> Revival: the removals below all landed in the `chore/audit-cleanup` change. To bring one back,
-> check out the file from the commit **before** that change (its parent on `main`), e.g.
-> `git log --oneline -- coastal/abm.py` then `git checkout <parent> -- coastal/abm.py`, and lift the
-> named symbols. (Fill the exact parent SHA here once the audit-cleanup commit is merged.)
+> Revival: the removals landed in the `chore/audit-cleanup` commit **`deb8be5`**. To bring one
+> back, take the file from its parent **`deb8be5^`** (the pre-removal state) and lift the named
+> symbols — e.g. `git checkout deb8be5^ -- coastal/abm.py`, or `git show deb8be5^:coastal/abm.py`.
 
 ---
 

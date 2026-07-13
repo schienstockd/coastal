@@ -53,3 +53,30 @@ Set up `github.com/schienstockd/coastal` and the contribution standards:
   explicitly noting Claude could not run or validate the package.
 - Applied cecelia's TODO policy: `docs/TODO.md` tracks **open work only** (items deleted when done);
   the shipped `## Fixed` history moved to this ledger + git.
+
+## 2026-07-13 — Self-contained pixi dev environment
+- Added `pixi.toml` + `pixi.lock`: a reproducible env (Python 3.12 + coastal editable with
+  dev/notebooks extras + cecelia linked editable + JupyterLab), independent of the old miniconda
+  `r-cecelia-env`. Tasks: `pixi run kernel` / `test` / `lab` / `doctor`.
+- `pyproject.toml` stays the single dep source; `pixi.toml` adds only Python + the editable cecelia
+  link + Jupyter. `scripts/link_cecelia.sh` kept as the non-pixi fallback.
+- **First real end-to-end execution of the package** happened here — `pixi run doctor` →
+  torch 2.13+cu130 `cuda True`, `cv2`, editable `cecelia` all import; `pixi run test` green. This
+  corrected the earlier assumption that the package could not be run in Claude's environment.
+
+## 2026-07-13 — Audit cleanup (dead ends removed, numerical bugs fixed)
+- **Numerical bugs fixed** (with golden tests): `utils.intersection_over_union` now computes true
+  Jaccard (was L1 containment; matches cellpose stitch3D); `flow.py` deformation metrics
+  (divergence/vorticity/strain) corrected swapped gradient axes via a testable `_flow_deformation`;
+  `direction_stability` made a proper cosine. These change feature values / stitching → retrain +
+  re-tune `stitch_threshold`.
+- **Two crashes fixed**: `TwoPassSegmentationInference` (`prob_merge_weight_*` → `prob_weight_*`);
+  `optimize_tracking_cma` (`track_physics` → `track_sequence`, bounds reconciled, x0-dim bug).
+- **Dead ends removed → `docs/DEAD_ENDS.md`** (append-only ledger with git ref to revive): the ABM
+  tracker, HMM boundary-state morphology (polygon/shape readout kept), and the tracking cost terms
+  `w_app`/`w_collective`/`w_persistence`/`w_vpred`/`w_exclusion`/`w_breadcrumb` + their helpers.
+  `track_sequence` now keeps Mahalanobis + `w_flow` + `w_color` only (~−1100 LOC net).
+- Added `notebooks/pipeline_consensus.ipynb` — the clean current end-to-end workflow.
+- Cruft + doc drift swept: unused imports, stale docstrings, χ² gate label + Mahalanobis (DeepSORT)
+  citation, regenerated `SEGMENTATION.md` metric list, `TRACKING`/`ARCHITECTURE`/`OPTIMIZATION`/
+  `MORPHOLOGY` drift.

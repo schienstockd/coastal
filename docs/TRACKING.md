@@ -10,21 +10,21 @@ Input: `instances_4d [T, Z, H, W]` from segmentation. Output: `{track_id: {t: po
 ## Design (`abm.py::track_sequence`)
 
 Constant-velocity Kalman filter + Hungarian LAP assignment per consecutive frame pair. Cost
-matrix (every term optional, weighted):
+matrix — the Mahalanobis gate is always on; the two extra terms are weighted (0 = off):
 
 ```
-cost = dist_cost                          # Mahalanobis, chi²-gated
-     [+ w_flow        * flow_warp_cost]   # dense Farneback flow deviation (geometric, no model)
-     [+ w_color       * color_cost]       # confetti RGB cosine distance (geometric, no model)
-     [+ w_ctx         * ctx_cost]         # ContextAssigner joint transformer (learned)
-     [+ w_collective  * collective_cost]  # neighbour-velocity coherence
-     [+ w_persistence * persistence_cost] # turn penalty
-     [+ w_exclusion   * exclusion_cost]   # contact repulsion
+cost = dist_cost                     # Mahalanobis position gate (χ²₃-gated), always on
+     [+ w_flow  * flow_warp_cost]    # dense Farneback flow deviation (geometric, no model)
+     [+ w_color * color_cost]        # confetti RGB cosine distance (geometric, no model)
 ```
+
+Several other cost terms (learned appearance/embeddings, collective-motion, persistence/turn,
+velocity-prediction, contact-exclusion, breadcrumb) and an agent-based (`ABMTracker`) variant were
+tried and **removed** — see [`DEAD_ENDS.md`](DEAD_ENDS.md) (with git refs to revive them).
 
 Supporting pieces: `track.py` (`Track` dataclass, `compute_3d_centroids`, `extract_cell_colors`,
-`extract_cell_intensities`, `ContextAssigner`), `abm.py` (`compute_cell_flow_features`,
-`BreadcrumbField`/`CellAgent`/`ABMTracker` breadcrumb-density variant, `stitch_tracklets`).
+`extract_cell_intensities`), `abm.py` (`compute_cell_flows` — the flow field for `w_flow`,
+`stitch_tracklets` gap-closing, `score_tracking`).
 
 ### Anisotropy is load-bearing
 Z = 4.0 µm/px, XY ≈ 0.48 µm/px (ratio 8.33×). An isotropic Kalman in raw pixel coords
@@ -65,11 +65,14 @@ Full table + btrack comparisons + phase log: `../TRACKING_SESSION_SUMMARY.md`.
   the LAP, EMA-update the track colour. `w_color=1.0` improves switch_rate at ~zero continuity
   cost; higher trades continuity for switch_rate.
 
-**Failed (learned / appearance-based)** — see also `MORPHOLOGY.md`:
-- HMM morphology, PatchEncoder, FlowEncoder — cells are identical greyscale blobs, no signal.
-- ContextAssigner (4 variants) — consistently trades switch_rate for continuity; softer gates,
-  not better assignments.
-- Intrinsic motion prior (Phase 8) — redundant with the Mahalanobis term already in Kalman.
+**Tried and removed** — cells are identical greyscale blobs, so learned/appearance and extra
+motion-prior terms never beat the geometric baseline on both metrics. Each is recorded in
+[`DEAD_ENDS.md`](DEAD_ENDS.md) with a git ref to revive it (see also `MORPHOLOGY.md`):
+- Learned appearance/embeddings, HMM morphology, PatchEncoder/FlowEncoder — no signal in greyscale.
+- ContextAssigner (4 variants) — consistently traded switch_rate for continuity, never both.
+- Collective-motion, persistence/turn, contact-exclusion, breadcrumb priors — no net win.
+- Intrinsic motion / velocity-prediction prior (Phase 8) — redundant with the Mahalanobis term.
+- ABM (agent-based) tracker — never beat Kalman + LAP.
 
 ## Key diagnostic
 

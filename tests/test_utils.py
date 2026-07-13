@@ -46,6 +46,17 @@ def test_intersection_over_union_perfect_overlap():
     assert np.isclose(iou[1, 1], 1.0)
 
 
+def test_intersection_over_union_is_jaccard_not_containment():
+    # x label 1 = 10 px, y label 1 = 20 px, overlap = 5 px.
+    # True IOU (Jaccard) = 5 / (10 + 20 - 5) = 0.2.
+    # The old (buggy) row-L1 containment would give 5/10 = 0.5 — this test pins the fix.
+    x = np.zeros(30, dtype=np.int32); x[:10] = 1
+    y = np.zeros(30, dtype=np.int32); y[5:25] = 1
+    iou = intersection_over_union(x.reshape(6, 5), y.reshape(6, 5)).toarray()
+    assert np.isclose(iou[1, 1], 0.2)
+    assert not np.isclose(iou[1, 1], 0.5)
+
+
 def test_match_masks_3d_unifies_same_object_across_slices():
     # Same 2x2 object in two Z-slices under different label ids (5 and 9).
     # After matching, both slices must carry one identical nonzero label.

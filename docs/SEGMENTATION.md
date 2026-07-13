@@ -105,21 +105,24 @@ labels across Z by sparse IOU overlap, then bridges chains broken by ≤ `gap_to
 
 ## Appendix: flow-metric reference
 
-Folded in from the former root-level `QUICK_REFERENCE.txt`. The full 16-metric set produced by
+Folded in from the former root-level `QUICK_REFERENCE.txt`. The 15-metric set produced by
 `prepare_data_for_unet(frames, temporal_scales=[1,2,4,8])`, and how to select a subset via
-`metrics_to_tensor(temporal_metrics, selected_keys=...)`.
+`metrics_to_tensor(temporal_metrics, selected_keys=...)`. (List regenerated from
+`flow.py::extract_temporal_metrics` — the emitted keys, not an idealised set.)
 
-### The 16 metrics
+### The 15 metrics
 - **4 multi-scale magnitudes** — `mag_1` (frame-to-frame, fine but noisy), `mag_2`, `mag_4`,
   `mag_8` (longer gaps, less noise, more persistent patterns).
-- **3 temporal consistency** — `motion_consistency` (similarity across scales; 0 = noise,
-  1 = coherent), `acceleration`, `direction_stability`.
+- **2 temporal dynamics** — `acceleration` (change in flow magnitude across scales),
+  `direction_stability` (cosine between the coarse- and fine-scale flow vectors, clipped to [0,1]).
 - **1 cumulative displacement** — `cumulative_mag` (total movement over the window; on its own
   separates fast / slow / stationary cells).
-- **3 deformation** — `divergence` (local expansion/compression), `vorticity` (rotation),
-  `strain` (total deformation).
-- **2 structural** — `edge_strength` (image gradient), `motion_at_edges`.
-- **1 target** — `cell_boundary_likelihood`.
+- **3 deformation** — `divergence` (∂u/∂x + ∂v/∂y, expansion/compression), `vorticity`
+  (∂v/∂x − ∂u/∂y, rotation), `strain` (symmetric strain-rate-tensor magnitude).
+- **1 structural** — `edge_strength` (structure-tensor λ₁−λ₂ edge measure on the image).
+- **3 flow↔image alignment** — `flow_structure_alignment` (|cos| of flow vs image gradient),
+  `normal_flow` and `tangential_flow` (flow components ⟂ / ∥ to the image gradient).
+- **1 target** — `cell_boundary_likelihood` (weighted blend used as the boundary prior).
 
 Why multi-scale: it turns "is this pixel moving *now*?" (noisy, ambiguous) into "what is this
 pixel's motion *signature* over time?" (robust) — which is what makes cells separable without
@@ -131,11 +134,11 @@ bright reporters. See `FAQ.md`.
 - `cumulative_window`: `3` fast · **`5` recommended** · `7` more temporal context.
 
 ### Metric-selection presets
-- **Minimum (5)**: `mag_1`, `cumulative_mag`, `edge_strength`, `motion_at_edges`,
+- **Minimum (5)**: `mag_1`, `cumulative_mag`, `edge_strength`, `tangential_flow`,
   `cell_boundary_likelihood`.
-- **Recommended (12)**: the 4 `mag_*`, `motion_consistency`, `cumulative_mag`, `divergence`,
-  `vorticity`, `strain`, `edge_strength`, `motion_at_edges`, `cell_boundary_likelihood`.
-- **All (16)**: default (no `selected_keys`).
+- **Recommended (11)**: the 4 `mag_*`, `direction_stability`, `cumulative_mag`, `divergence`,
+  `vorticity`, `strain`, `edge_strength`, `cell_boundary_likelihood`.
+- **All (15)**: default (no `selected_keys`).
 
 The UNet's `in_channels` must match the metric count chosen (plus the frame channel — see the
 data contract in `docs/ARCHITECTURE.md`).

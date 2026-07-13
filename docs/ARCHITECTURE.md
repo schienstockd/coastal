@@ -44,9 +44,9 @@ tracks                                        {track_id: {t: pos_um}}
 | `segment.py` | `LearnedAffinityInference`, `TwoPassSegmentationInference`, `Inference3D` | segmentation | `SEGMENTATION.md` |
 | `utils.py` | `intersection_over_union`, `match_masks_3d`, `filter_small_cells` | segmentation | `SEGMENTATION.md` |
 | `data.py` | `prepare_training_data`, `validate_training_data`; cecelia I/O contract | shared | `DATA.md` |
-| `track.py` | `Track` dataclass, centroid/colour/intensity extraction, `ContextAssigner` | tracking | `TRACKING.md` |
-| `abm.py` | `track_sequence` (Kalman+LAP), cost terms, `score_tracking`, breadcrumb ABM | tracking | `TRACKING.md` |
-| `morphology.py` | polygon extraction + boundary HMM | tracking (failed) | `MORPHOLOGY.md` |
+| `track.py` | `Track` dataclass, centroid/colour/intensity extraction | tracking | `TRACKING.md` |
+| `abm.py` | `track_sequence` (Kalman+LAP; Mahalanobis + `w_flow` + `w_color`), `score_tracking`, `stitch_tracklets` | tracking | `TRACKING.md` |
+| `morphology.py` | polygon + shape-feature readout (standalone; not wired in) | shared | `MORPHOLOGY.md` |
 | `optimize.py` | CMA-ES tuning of segmentation + tracking params | shared | `OPTIMIZATION.md` |
 | `viz.py` | overlays, RGB+segmentation plots, MP4 export | shared | — |
 

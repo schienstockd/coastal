@@ -29,16 +29,9 @@ from coastal.optimize import (
 )
 from coastal.morphology import (
     labels_to_polygons,
-    fit_boundary_hmm,
-    assign_boundary_states,
-    assign_boundary_hmm_features,
-    extract_boundary_features,
     extract_shape_features,
     extract_cell_morphology,
-    median_filter_states,
-    enforce_min_run_length,
     SHAPE_FEATURE_NAMES,
-    hmm_feature_dim,
 )
 from coastal.track import (
     Track,
@@ -47,17 +40,9 @@ from coastal.track import (
     extract_cell_intensities,
 )
 from coastal.abm import (
-    BreadcrumbField,
-    MotilityState,
-    CellAgent,
-    ABMTracker,
-    track_abm,
     compute_cell_flows,
     compute_cell_flow_features,
-    smooth_cell_flows,
-    blend_flows,
     track_sequence,
-    extract_cell_embeddings,
     stitch_tracklets,
     score_tracking,
 )
@@ -69,6 +54,7 @@ __all__ = [
     "VarianceMetricsLoss",
     "WarpConsistencyLoss",
     "compute_variance_metrics",
+    "VarianceMetricsConfig",
     "normalize_and_project",
     "extract_dense_flow_pairs",
     "train_with_metrics",
@@ -98,33 +84,18 @@ __all__ = [
     "TRACKING_PARAM_BOUNDS",
     # morphology
     "labels_to_polygons",
-    "fit_boundary_hmm",
-    "assign_boundary_states",
-    "assign_boundary_hmm_features",
-    "extract_boundary_features",
     "extract_shape_features",
     "extract_cell_morphology",
-    "median_filter_states",
-    "enforce_min_run_length",
     "SHAPE_FEATURE_NAMES",
-    "hmm_feature_dim",
     # tracking — data structures + feature extraction
     "Track",
     "compute_3d_centroids",
     "extract_cell_colors",
     "extract_cell_intensities",
-    # ABM / tracking inference
-    "BreadcrumbField",
-    "MotilityState",
-    "CellAgent",
-    "ABMTracker",
-    "track_abm",
+    # tracking inference
     "compute_cell_flows",
     "compute_cell_flow_features",
-    "smooth_cell_flows",
-    "blend_flows",
     "track_sequence",
-    "extract_cell_embeddings",
     "stitch_tracklets",
     "score_tracking",
 ]

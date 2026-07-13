@@ -92,7 +92,7 @@ def compute_cumulative_displacement_frame(center_idx, frames_array, window_size)
             vx_cum += vx
             vy_cum += vy
             frame_count += 1
-        except Exception as e:
+        except Exception:
             continue
     
     if center_idx < 3 or center_idx % 50 == 0:
@@ -128,25 +128,29 @@ def compute_cumulative_displacement(frames, window_size=5, n_jobs=-1, verbose=Tr
     return cumulative_flows
 
 
-def normalize_metric(arr, percentile=(5, 95)):
-    """Normalize to [0, 1] robustly."""
-    arr = np.asarray(arr)
-    
-    vmin = np.percentile(arr, percentile[0])
-    vmax = np.percentile(arr, percentile[1])
-    
-    range_val = vmax - vmin
-    
-    if range_val < 1e-8:
-        vmin = arr.min()
-        vmax = arr.max()
-        range_val = vmax - vmin
-    
-    if range_val < 1e-8:
-        return np.ones_like(arr, dtype=np.float32) * 0.5
-    
-    normalized = (arr - vmin) / (range_val + 1e-5)
-    return np.clip(normalized, 0, 1).astype(np.float32)
+def _flow_deformation(u, v):
+    """Divergence, vorticity and strain-rate magnitude of a 2D flow field.
+
+    ``u`` = x-displacement, ``v`` = y-displacement on an image array with axes
+    ``[y=0, x=1]``, so ``∂/∂x = np.gradient(·, axis=1)`` and ``∂/∂y = np.gradient(·, axis=0)``.
+
+      divergence = ∂u/∂x + ∂v/∂y   (expansion / compression)
+      vorticity  = ∂v/∂x − ∂u/∂y   (rotation)
+      strain     = ‖E‖ of the symmetric strain-rate tensor,
+                   E_xx=∂u/∂x, E_yy=∂v/∂y, E_xy=½(∂u/∂y + ∂v/∂x)
+
+    Returns raw (un-normalised) arrays; callers normalise for the learned features.
+    """
+    du_dx = np.gradient(u, axis=1)
+    du_dy = np.gradient(u, axis=0)
+    dv_dx = np.gradient(v, axis=1)
+    dv_dy = np.gradient(v, axis=0)
+
+    divergence = du_dx + dv_dy
+    vorticity = dv_dx - du_dy
+    E_xy = 0.5 * (du_dy + dv_dx)
+    strain = np.sqrt(du_dx**2 + dv_dy**2 + 2 * E_xy**2)
+    return divergence, vorticity, strain
 
 
 def extract_temporal_metrics(frames, multi_scale_flows, cumulative_flows, frame_idx):
@@ -188,8 +192,11 @@ def extract_temporal_metrics(frames, multi_scale_flows, cumulative_flows, frame_
         
         _, u0, v0, _ = scale_data[0]
         _, un, vn, _ = scale_data[-1]
-        mprod = np.sqrt(u0**2 + v0**2 + un**2 + vn**2 + 1e-5)
-        dot = (u0*un + v0*vn) / (mprod + 1e-5)
+        # Cosine similarity between coarse- and fine-scale flow vectors:
+        # (f0·fn) / (|f0|·|fn|), clipped to [0,1] (keep only aligned/stable directions).
+        mag0 = np.sqrt(u0**2 + v0**2)
+        magn = np.sqrt(un**2 + vn**2)
+        dot = (u0*un + v0*vn) / (mag0 * magn + 1e-5)
         metrics['direction_stability'] = np.clip(dot, 0, 1).astype(np.float32)
     
     # ==== CUMULATIVE DISPLACEMENT ====
@@ -203,21 +210,9 @@ def extract_temporal_metrics(frames, multi_scale_flows, cumulative_flows, frame_
     
     # ==== FLOW DEFORMATION (divergence, vorticity, strain) ====
     _, u, v, _ = scale_data[0]
-    
-    du_dx = np.gradient(u, axis=0)
-    dv_dy = np.gradient(v, axis=1)
-    divergence = du_dx + dv_dy
+    divergence, vorticity, strain = _flow_deformation(u, v)
     metrics['divergence'] = normalize_metric(divergence)
-    
-    dv_dx = np.gradient(v, axis=0)
-    du_dy = np.gradient(u, axis=1)
-    vorticity = dv_dx - du_dy
     metrics['vorticity'] = normalize_metric(vorticity)
-    
-    S_xx = du_dx
-    S_yy = dv_dy
-    S_xy = 0.5 * (np.gradient(u, axis=1) + np.gradient(v, axis=0))
-    strain = np.sqrt(S_xx**2 + S_yy**2 + 2*S_xy**2)
     metrics['strain'] = normalize_metric(strain)
     
     # ==== STRUCTURE TENSOR (image) ====
@@ -285,13 +280,10 @@ def compute_all_temporal_metrics(frames, multi_scale_flows, cumulative_flows, ve
     return metrics_all
 
 
-"""Variance metrics for multi-channel fluorescence images."""
-
 from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
-from scipy.ndimage import uniform_filter, gaussian_filter
+from scipy.ndimage import gaussian_filter
 
 
 def normalize_metric(arr: np.ndarray, percentile: tuple = (0.02, 99.98)) -> np.ndarray:

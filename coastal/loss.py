@@ -175,10 +175,18 @@ class WarpConsistencyLoss(nn.Module):
 
 
 class VarianceMetricsLoss(nn.Module):
-    """Windowed contrastive loss on cross-channel variance metrics.
+    """Windowed repulsion loss on cross-channel variance metrics.
 
-    Compares pixels only within random spatial windows so the loss sees both
-    same-cell positives and cross-cell negatives within each patch.
+    Within random spatial windows, pushes apart the embeddings of the pixels that are
+    *farthest* in metric space (the k hardest negatives per pixel): it is a
+    **negatives-only** term — there is no positive/attraction pull here. The attractive
+    signal comes from the other losses (``IntensityLoss``, ``TemporalMetricsLoss``);
+    this one only adds cross-cell separation on the variance channels.
+
+    NOTE: an earlier docstring claimed this also pulled same-cell positives together; it
+    never did. If a symmetric push/pull is wanted, add a ``loss_pos`` on ``sorted_idx[:, 1:k+1]``
+    mirroring ``TemporalMetricsLoss`` — that is a training-behaviour change, deliberately
+    left out here.
     """
 
     def __init__(self, k_neighbors=10, margin=0.5, window_size=32, max_tiles=8):

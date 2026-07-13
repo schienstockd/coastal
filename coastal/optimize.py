@@ -245,10 +245,11 @@ def optimize_segmentation_cma(
 # Tracking parameter optimisation                                              #
 # --------------------------------------------------------------------------- #
 
+# Only the parameters the settled track_sequence actually accepts (see DEAD_ENDS.md — the
+# w_collective/w_persistence/w_exclusion/cost_appear/cost_disappear terms were removed).
 TRACKING_PARAM_NAMES = [
     'chi2_gate', 'process_noise', 'obs_noise',
-    'w_flow', 'w_collective', 'w_persistence', 'w_exclusion',
-    'cost_appear', 'cost_disappear', 'momentum_decay',
+    'w_flow', 'w_color', 'max_cost', 'momentum_decay',
 ]
 
 TRACKING_PARAM_BOUNDS = {
@@ -256,11 +257,8 @@ TRACKING_PARAM_BOUNDS = {
     'process_noise':   (0.1,  10.0),
     'obs_noise':       (1.0,  50.0),
     'w_flow':          (0.0,   1.0),
-    'w_collective':    (0.0,   0.5),
-    'w_persistence':   (0.0,   0.5),
-    'w_exclusion':     (0.0,   0.5),
-    'cost_appear':     (0.1,   2.0),
-    'cost_disappear':  (0.1,   2.0),
+    'w_color':         (0.0,   2.0),
+    'max_cost':        (0.5,   2.0),
     'momentum_decay':  (0.5,  0.99),
 }
 
@@ -305,7 +303,7 @@ def optimize_tracking_cma(
     w_switch=0.5,
     w_continuity=0.5,
 ):
-    """CMA-ES optimisation of track_physics parameters.
+    """CMA-ES optimisation of track_sequence parameters.
 
     Uses score_tracking (switch_rate + continuity) as the closed-loop objective.
 
@@ -319,20 +317,17 @@ def optimize_tracking_cma(
         x0:                initial parameter vector (None → mid-range)
         sigma0:            initial CMA-ES step size (default 0.15)
         max_evals:         evaluation budget (default 100)
-        fixed_params:      dict of additional track_physics kwargs held fixed
+        fixed_params:      dict of additional track_sequence kwargs held fixed
                            (e.g. {'max_gap': 2, 'min_cell_size_px': 200})
         w_switch:          weight for switch_rate in scalar objective (default 0.5)
         w_continuity:      weight for (1 - continuity) in scalar objective (default 0.5)
 
     Returns:
-        best_params:  dict of best parameters found (pass to track_physics)
+        best_params:  dict of best parameters found (pass to track_sequence)
         history:      list of (params_dict, score) tuples, one per evaluation
     """
-    from coastal.abm import track_physics, score_tracking
+    from coastal.abm import track_sequence, score_tracking
     from coastal.track import extract_cell_colors, compute_3d_centroids
-
-    if x0 is None:
-        x0 = list(0.5 * (_TLO + _THI))
 
     fixed = fixed_params or {}
 
@@ -360,12 +355,11 @@ def optimize_tracking_cma(
     def objective(x):
         params = _vec_to_search_params(x)
         params.update(fixed)
-        tracks = track_physics(
+        tracks = track_sequence(
             instances_4d=instances_4d,
             pix_res=pix_res,
             cell_flows=cell_flows,
             dense_flow_fields=dense_flow_fields,
-            _centroids=_centroids,
             **params,
         )
         metrics = score_tracking(

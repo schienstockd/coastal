@@ -40,6 +40,9 @@ See also:
 - [`docs/MILESTONES.md`](docs/MILESTONES.md) — append-only ledger of what landed.
 - [`docs/FUTURE.md`](docs/FUTURE.md) — deliberately deferred ideas: what / why deferred / when
   to revisit.
+- [`docs/DEAD_ENDS.md`](docs/DEAD_ENDS.md) — tried-and-failed approaches removed from the live
+  code: what / why dropped / git ref to revive / what would rule them in. (Distinct from
+  `FUTURE.md`, which is deferred-but-untried.)
 - [`docs/todo/README.md`](docs/todo/README.md) — the parked-plan convention (`*_PLAN.md`).
 - [`docs/DEV.md`](docs/DEV.md) — development workflow: branches, commits, PRs, CI, and the
   never-push-to-`main` + ask-before-every-commit + reservations-first rules.
@@ -56,6 +59,7 @@ See also:
 | Input/output format, `prepare_data_for_unet`, cecelia integration | `docs/DATA.md` |
 | Julia-portability status of any component | `docs/JULIA_PORT.md` |
 | Deferring a known-better approach | `docs/FUTURE.md` |
+| Removing a tried-and-failed approach (dead end) | `docs/DEAD_ENDS.md` |
 | A decision becomes *surprising* to an outside reader | `FAQ.md` (one punchy Q&A; keep detail in `docs/`) |
 | Branching, commits, PRs, CI (dev workflow) | `docs/DEV.md` |
 
@@ -93,7 +97,9 @@ jupyter notebook notebooks/optical_flow.ipynb   # segmentation work
 
 ## Notebooks
 
-`notebooks/` holds the three live notebooks: `tracking.ipynb`, `optical_flow.ipynb`, and
-`pipeline_confetti_ceiling.ipynb` (Phase 9 colour-cost work). Superseded prototypes
-(`treecell-v*`, `treemove-v*`, `optical_flow-old`) are in `notebooks/archive/` — history, not
-instructions.
+`notebooks/pipeline_consensus.ipynb` is the **clean, current end-to-end workflow** (post-audit
+API: cecelia load → flow-metric UNet → 3D+T labels → Kalman+LAP `w_flow`+`w_color` tracking →
+scoring) — start here. The exploratory notebooks (`tracking.ipynb`, `optical_flow.ipynb`,
+`pipeline_confetti_ceiling.ipynb`) carry the full experiment history and reference removed
+approaches (see `docs/DEAD_ENDS.md`). Superseded prototypes (`treecell-v*`, `treemove-v*`,
+`optical_flow-old`) are in `notebooks/archive/` — history, not instructions.

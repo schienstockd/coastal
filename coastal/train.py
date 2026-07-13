@@ -610,8 +610,6 @@ def prepare_data_for_unet_batch_4d(
         return all_frames, all_temporal, all_variance, all_frames_multi, all_flow_pairs
     return all_frames, all_temporal, all_variance, all_frames_multi
 
-    return all_frames, all_temporal, all_variance, all_frames_multi
-
 
 def prepare_data_for_unet_batch(movies, temporal_scales=[1, 2, 4, 8], cumulative_window=5):
     """

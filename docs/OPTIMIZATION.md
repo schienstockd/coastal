@@ -15,7 +15,8 @@ CMA-ES hyperparameter tuning (`optimize.py`, ~424 LOC) for both subsystems, via
 ## Tracking tuning
 
 - `optimize_tracking_cma(...)` — searches `track_sequence` cost weights (`w_flow`, `w_color`,
-  `w_ctx`, gate, …) within `TRACKING_PARAM_BOUNDS`.
+  `chi2_gate`, `max_cost`, …) within `TRACKING_PARAM_BOUNDS`. (The removed cost terms — `w_ctx`
+  and friends — are gone; see `DEAD_ENDS.md`.)
 - Objective: `score_tracking_scalar(...)` — scalarised combination of `continuity` and
   `switch_rate` (see `docs/TRACKING.md` for the two metrics; the scalarisation is where the
   continuity/switch_rate trade-off is encoded — document any change to the weighting here).

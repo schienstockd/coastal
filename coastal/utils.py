@@ -2,7 +2,6 @@
 
 import numpy as np
 from scipy.sparse import coo_array
-from sklearn.preprocessing import normalize
 
 
 def filter_small_cells(instances_4d: np.ndarray, min_voxels: int = 200) -> np.ndarray:
@@ -36,9 +35,20 @@ def label_overlap(x, y, dtype=np.uint16):
 
 
 def intersection_over_union(x, y, dtype=np.uint16):
-    """Compute IOU between label maps x and y (sparse matrix)."""
-    overlap = label_overlap(x, y, dtype=dtype)
-    return normalize(overlap, norm='l1', axis=1).astype(np.float32)
+    """True IOU (Jaccard) between label maps x and y, as a sparse [n_x, n_y] matrix.
+
+    iou[i, j] = |x==i ∩ y==j| / |x==i ∪ y==j|, matching the cellpose stitch3D
+    definition (Stringer et al. 2021, Cellpose ``metrics._intersection_over_union``).
+    Row 0 / column 0 are the background labels; callers slice them off (``[1:, 1:]``).
+    Returns a CSR matrix so downstream ``.argmax``/``.max``/``.toarray`` still work.
+    """
+    overlap = label_overlap(x, y, dtype=dtype).tocsr()
+    area_x = np.asarray(overlap.sum(axis=1)).ravel()   # pixels per x-label (over all y incl. bg)
+    area_y = np.asarray(overlap.sum(axis=0)).ravel()   # pixels per y-label (over all x incl. bg)
+    coo = overlap.tocoo()
+    union = area_x[coo.row] + area_y[coo.col] - coo.data
+    iou_data = coo.data / union
+    return coo_array((iou_data, (coo.row, coo.col)), shape=overlap.shape).tocsr().astype(np.float32)
 
 
 def _bridge_label_gaps(masks_list, gap_tolerance, iou_threshold):

@@ -10,7 +10,7 @@ See TUNING_GUIDE.md for decision-tree parameter tuning.
 import numpy as np
 import torch
 from scipy import ndimage
-from scipy.ndimage import binary_dilation, binary_erosion, gaussian_filter, maximum_filter, distance_transform_edt
+from scipy.ndimage import binary_dilation, gaussian_filter, maximum_filter, distance_transform_edt
 from skimage.measure import regionprops
 
 from coastal.utils import match_masks_3d
@@ -164,28 +164,14 @@ class LearnedAffinityInference:
                 Default: 12
             
             min_boundary_pixels: minimum contact pixels required to consider merging [1–3]
-                Soft floor; contact_ratio is primary filter. Default: 1
+                Soft floor; contact brightness is the primary filter. Default: 1
 
-            contact_ratio_threshold: contact size relative to smaller fragment [0.01–0.10]
-                Ratio = n_contact / min(size1, size2).
-                Larger ratio → more contact relative to fragment size → easier to merge.
-                Accounts for size: small fragments need smaller absolute contact.
-                0.05 = 5% of smaller fragment must be in contact. Default: 0.05
+            NOTE: merging uses AND logic (contact brightness ≥ threshold AND embedding affinity
+            ≥ merge_affinity_threshold), NOT a weighted "hybrid score". Earlier docstrings here
+            documented `contact_ratio_threshold` / `hybrid_score_threshold` / `contact_prob_weight`
+            / `contact_ratio_weight` / `affinity_weight` — none of those are constructor params;
+            that scoring scheme was abandoned. See `_merge_split_instances`.
 
-            hybrid_score_threshold: overall merge score threshold [0.3–0.7]
-                Score = (contact_prob * contact_prob_weight) + (contact_ratio * contact_ratio_weight)
-                        + (affinity * affinity_weight)
-                If score > threshold, merge. Default: 0.50
-
-            contact_prob_weight: weight for contact brightness in hybrid score [0.0–0.5]
-                How much contact region brightness matters. Default: 0.4
-
-            contact_ratio_weight: weight for contact size ratio in hybrid score [0.0–0.5]
-                How much relative contact size matters. Default: 0.3
-
-            affinity_weight: weight for embedding affinity in hybrid score [0.0–0.5]
-                How much embedding similarity matters. Default: 0.3
-            
             OPTIONAL TUNING PARAMETERS (4):
             
             prob_threshold: binary mask cutoff [0.2–0.5]
@@ -644,14 +630,14 @@ class TwoPassSegmentationInference:
                  embedding_blur_sigma_large=1.5,
                  merge_max_distance_large=1.5,
                  merge_affinity_threshold_large=0.65,
-                 prob_merge_weight_large=0.3,
+                 prob_weight_large=0.3,
                  merge_contact_brightness_threshold_large=0.60,
                  seed_size_small=10,
                  affinity_threshold_small=0.4,
                  embedding_blur_sigma_small=1.5,
                  merge_max_distance_small=1.5,
                  merge_affinity_threshold_small=0.60,
-                 prob_merge_weight_small=0.3,
+                 prob_weight_small=0.3,
                  merge_contact_brightness_threshold_small=0.60,
                  max_iter=100,
                  min_component_size=20,
@@ -669,7 +655,8 @@ class TwoPassSegmentationInference:
             affinity_threshold_large: affinity threshold for region growing
             merge_max_distance_large: max Euclidean pixel gap for fragment merge candidates
             merge_affinity_threshold_large: affinity threshold for merging fragments
-            prob_merge_weight_large: how much gap prob reduces required affinity (0 = disabled)
+            prob_weight_large: region-growing relaxation — how much pixel prob lowers the
+                required grow affinity (required = affinity_threshold - prob * prob_weight; 0 = off)
             merge_contact_brightness_threshold_large: contact must be bright to merge [0.5–0.7]
 
             # Pass 2 parameters (small fragments)
@@ -677,7 +664,8 @@ class TwoPassSegmentationInference:
             affinity_threshold_small: affinity threshold for region growing
             merge_max_distance_small: max Euclidean pixel gap for fragment merge candidates
             merge_affinity_threshold_small: affinity threshold for merging fragments
-            prob_merge_weight_small: how much gap prob reduces required affinity (0 = disabled)
+            prob_weight_small: region-growing relaxation — how much pixel prob lowers the
+                required grow affinity (required = affinity_threshold - prob * prob_weight; 0 = off)
             merge_contact_brightness_threshold_small: contact must be bright to merge [0.5–0.7]
 
             # Shared
@@ -700,7 +688,7 @@ class TwoPassSegmentationInference:
             embedding_blur_sigma=embedding_blur_sigma_large,
             merge_max_distance=merge_max_distance_large,
             merge_affinity_threshold=merge_affinity_threshold_large,
-            prob_merge_weight=prob_merge_weight_large,
+            prob_weight=prob_weight_large,
             merge_contact_brightness_threshold=merge_contact_brightness_threshold_large,
             min_boundary_pixels=min_boundary_pixels,
         )
@@ -716,7 +704,7 @@ class TwoPassSegmentationInference:
             embedding_blur_sigma=embedding_blur_sigma_small,
             merge_max_distance=merge_max_distance_small,
             merge_affinity_threshold=merge_affinity_threshold_small,
-            prob_merge_weight=prob_merge_weight_small,
+            prob_weight=prob_weight_small,
             merge_contact_brightness_threshold=merge_contact_brightness_threshold_small,
             min_boundary_pixels=min_boundary_pixels,
         )

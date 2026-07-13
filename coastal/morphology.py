@@ -1,14 +1,15 @@
-"""Cell morphology: boundary HMM states and 2D shape descriptors."""
+"""Cell morphology: 2D polygon extraction and shape descriptors (Z-max projection).
 
-import warnings
+NOTE: The polygon + shape-feature helpers in this module are RETAINED as a
+standalone morphology / QC readout utility. They are NOT currently wired into
+the segmentation or tracking pipelines, and are kept for potential future use.
+The former HMM boundary-state code path was a tried-and-failed tracking
+direction and has been removed.
+"""
+
 import numpy as np
 from multiprocessing import Pool
-from scipy.ndimage import gaussian_filter1d
 from skimage import measure
-from sklearn.preprocessing import StandardScaler
-from hmmlearn import hmm as hmmlearn_hmm
-from shapely.geometry import Polygon, MultiPolygon
-from shapely.ops import unary_union
 
 
 # --------------------------------------------------------------------------- #
@@ -111,296 +112,6 @@ def labels_to_polygons(instances_4d, n_workers=8, min_area=10, min_coords=8):
 
 
 # --------------------------------------------------------------------------- #
-# Boundary feature extraction                                                 #
-# --------------------------------------------------------------------------- #
-
-def _signed_curvature(X, Y):
-    dx = np.diff(X)
-    dy = np.diff(Y)
-    ddx = np.diff(dx)
-    ddy = np.diff(dy)
-    curvature = np.zeros(len(dx), dtype=np.float32)
-    denom = (dx[:-1] ** 2 + dy[:-1] ** 2) ** 1.5
-    valid = denom > 0
-    curvature[1:][valid] = (ddx * dy[:-1] - dx[:-1] * ddy)[valid] / denom[valid]
-    return curvature
-
-
-def extract_boundary_features(polygon, sigma=2.0):
-    """Per-segment boundary features: distance, angle_change, fold_score.
-
-    Returns:
-        np.ndarray [N_segments, 3] or None if polygon is too small
-    """
-    xs, ys = polygon.exterior.xy
-    X = gaussian_filter1d(np.array(xs, dtype=np.float32), sigma)
-    Y = gaussian_filter1d(np.array(ys, dtype=np.float32), sigma)
-
-    if len(X) < 4:
-        return None
-
-    dx = np.diff(X)
-    dy = np.diff(Y)
-    L = len(dx)
-
-    distances = np.sqrt(dx ** 2 + dy ** 2)
-
-    # Absolute angle change: how sharply the boundary turns, regardless of direction.
-    # 0 padded at start (first segment has no predecessor).
-    angles = np.degrees(np.arctan2(dy, dx))
-    wrapped = ((np.diff(angles) + 180.0) % 360.0) - 180.0
-    angle_change = np.empty(L, dtype=np.float32)
-    angle_change[0] = 0.0
-    angle_change[1:] = np.abs(wrapped)
-
-    # Signed fold score: positive = folding inward, negative = folding outward.
-    # Corrected for polygon winding direction, then tanh-normalized per polygon
-    # using the 90th-percentile as scale so values are bounded in (-1, 1) and
-    # comparable across cells of different sizes.
-    curvature = _signed_curvature(X, Y)[:L]
-
-    # Determine winding (positive signed area = CCW in image coords)
-    Xa = X[:-1] if (np.isclose(X[0], X[-1]) and np.isclose(Y[0], Y[-1])) else X
-    Ya = Y[:-1] if (np.isclose(X[0], X[-1]) and np.isclose(Y[0], Y[-1])) else Y
-    signed_area = 0.5 * float(np.sum(Xa * np.roll(Ya, -1) - np.roll(Xa, -1) * Ya))
-    sign_to_interior = 1.0 if signed_area > 0 else -1.0
-
-    raw_fold = sign_to_interior * curvature
-    abs_fold  = np.abs(raw_fold)
-    scale = float(np.percentile(abs_fold, 90)) if abs_fold.size else 0.0
-    if scale <= 0:
-        scale = float(abs_fold.max()) if abs_fold.max() > 0 else 1.0
-    fold_score = np.tanh(raw_fold / scale).astype(np.float32)
-    fold_score[np.abs(fold_score) < 1e-3] = 0.0
-
-    return np.stack([distances, angle_change, fold_score], axis=1).astype(np.float32)
-
-
-# --------------------------------------------------------------------------- #
-# HMM fitting                                                                 #
-# --------------------------------------------------------------------------- #
-
-def fit_boundary_hmm(polygons, n_states=4, train_fraction=0.8, max_polygons=3000,
-                     sigma=2.0, random_state=42):
-    """Fit Gaussian HMM on boundary segment features across all polygons.
-
-    Args:
-        polygons:       dict {t: {cell_id: Polygon}} or flat list of Polygons
-        n_states:       number of HMM hidden states (tunable)
-        train_fraction: fraction of polygons used for fitting
-        max_polygons:   hard cap on training polygons (HMM saturates quickly;
-                        3000 is ample for 4 states)
-        sigma:          boundary smoothing sigma
-        random_state:   RNG seed
-
-    Returns:
-        (hmm_model, scaler)
-    """
-    if isinstance(polygons, dict):
-        poly_list = [p for t_dict in polygons.values() for p in t_dict.values()]
-    else:
-        poly_list = list(polygons)
-
-    rng = np.random.default_rng(random_state)
-    idx = rng.permutation(len(poly_list))
-    n_train = max(1, min(int(len(poly_list) * train_fraction), max_polygons))
-    train_polys = [poly_list[int(i)] for i in idx[:n_train]]
-
-    all_feats, lengths = [], []
-    for poly in train_polys:
-        feat = extract_boundary_features(poly, sigma=sigma)
-        if feat is None or len(feat) < 2:
-            continue
-        all_feats.append(feat)
-        lengths.append(len(feat))
-
-    if not all_feats:
-        raise ValueError("No valid polygons for HMM training")
-
-    X_raw = np.vstack(all_feats)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_raw)
-
-    model = hmmlearn_hmm.GaussianHMM(
-        n_components=n_states,
-        covariance_type='diag',
-        n_iter=100,
-        random_state=random_state,
-    )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        model.fit(X_scaled, lengths=lengths)
-
-    print(f"HMM: {n_states} states fitted on {len(all_feats)} polygons "
-          f"({len(X_scaled)} boundary segments)")
-    return model, scaler
-
-
-def assign_boundary_states(
-    polygon,
-    hmm_model,
-    scaler,
-    sigma:                float = 2.0,
-    apply_state_smoothing: bool = True,
-    median_w:              int  = 3,
-    min_run:               int  = 3,
-) -> np.ndarray:
-    """Return per-state proportions for a polygon as a float array [n_states] summing to 1.
-
-    Returns zeros if the polygon is too small or invalid.
-    """
-    n = hmm_model.n_components
-    feat = extract_boundary_features(polygon, sigma=sigma)
-    if feat is None or len(feat) < 2:
-        return np.zeros(n, dtype=np.float32)
-    X = scaler.transform(feat)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        states = hmm_model.predict(X)
-    if apply_state_smoothing:
-        states = median_filter_states(states, w=median_w)
-        states = enforce_min_run_length(states, min_len=min_run)
-    counts = np.bincount(states, minlength=n).astype(np.float32)
-    return counts / counts.sum()
-
-
-def hmm_feature_dim(n_states: int) -> int:
-    """Total HMM feature vector length for a given n_states.
-
-    Components: proportions [n] + self_transitions [n] + run_mean [n]
-    """
-    return n_states * 3
-
-
-def _hmm_sequence_features(states: np.ndarray, n_states: int) -> np.ndarray:
-    """Compact HMM features from the ordered boundary state sequence.
-
-    All components are rotation-invariant (closed-loop):
-    - Proportions      [n_states] — fraction of boundary in each state
-    - Self-transitions [n_states] — P(stay | current state), diagonal of transition matrix
-    - Run-length mean  [n_states] — mean contiguous run per state / seq_len
-    """
-    n = len(states)
-    counts = np.bincount(states, minlength=n_states).astype(np.float32)
-    proportions = counts / max(float(counts.sum()), 1.0)
-
-    if n < 2:
-        return np.concatenate([
-            proportions,
-            np.zeros(n_states, dtype=np.float32),  # self-transitions
-            np.zeros(n_states, dtype=np.float32),  # run_mean
-        ])
-
-    # Transition matrix — closed loop (last → first); only diagonal is kept
-    trans = np.zeros((n_states, n_states), dtype=np.float32)
-    for i in range(n - 1):
-        trans[int(states[i]), int(states[i + 1])] += 1.0
-    trans[int(states[-1]), int(states[0])] += 1.0
-    row_sums = trans.sum(axis=1, keepdims=True)
-    trans /= np.where(row_sums > 0, row_sums, 1.0)
-    self_transitions = np.diag(trans)  # [n_states] — stickiness per state
-
-    # Mean run length, normalised by sequence length
-    rl_mean = np.zeros(n_states, dtype=np.float32)
-    runs: list = [[] for _ in range(n_states)]
-    run_s, run_l = int(states[0]), 1
-    for s in states[1:]:
-        s = int(s)
-        if s == run_s:
-            run_l += 1
-        else:
-            runs[run_s].append(run_l)
-            run_s, run_l = s, 1
-    runs[run_s].append(run_l)
-    for s in range(n_states):
-        if runs[s]:
-            rl_mean[s] = float(np.mean(runs[s])) / n
-
-    return np.concatenate([proportions, self_transitions, rl_mean])
-
-
-def median_filter_states(states: np.ndarray, w: int = 3) -> np.ndarray:
-    """Sliding-window mode filter: replace each state with the most common in a window of width w."""
-    half = w // 2
-    n = len(states)
-    out = states.copy()
-    for i in range(n):
-        lo, hi = max(0, i - half), min(n, i + half + 1)
-        vals, counts = np.unique(states[lo:hi], return_counts=True)
-        out[i] = vals[counts.argmax()]
-    return out
-
-
-def enforce_min_run_length(states: np.ndarray, min_len: int = 3) -> np.ndarray:
-    """Absorb runs shorter than min_len into the longer of their two neighboring runs.
-
-    Repeats until all runs are >= min_len (or there is only one run left).
-    """
-    states = states.copy()
-    changed = True
-    while changed:
-        changed = False
-        # Build run list: (start, end, state)
-        runs = []
-        i = 0
-        while i < len(states):
-            s = int(states[i])
-            j = i
-            while j < len(states) and int(states[j]) == s:
-                j += 1
-            runs.append((i, j, s))
-            i = j
-        for ri, (start, end, s) in enumerate(runs):
-            rlen = end - start
-            if rlen >= min_len:
-                continue
-            prev_len = runs[ri - 1][1] - runs[ri - 1][0] if ri > 0 else 0
-            next_len = runs[ri + 1][1] - runs[ri + 1][0] if ri < len(runs) - 1 else 0
-            if prev_len == 0 and next_len == 0:
-                break
-            if next_len >= prev_len:
-                merge_s = runs[ri + 1][2]
-            else:
-                merge_s = runs[ri - 1][2]
-            states[start:end] = merge_s
-            changed = True
-            break   # restart run detection after each merge
-    return states
-
-
-def assign_boundary_hmm_features(
-    polygon,
-    hmm_model,
-    scaler,
-    sigma:                float = 2.0,
-    apply_state_smoothing: bool = True,
-    median_w:              int  = 3,
-    min_run:               int  = 3,
-) -> np.ndarray:
-    """Full HMM feature vector for a polygon.
-
-    Returns hmm_feature_dim(n_states) values:
-    proportions + row-normalised transition matrix + run-length mean + run-length max.
-    Returns zeros if the polygon is too small or invalid.
-
-    apply_state_smoothing: apply median_filter_states then enforce_min_run_length before
-        computing the feature vector (cleans single-segment state noise).
-    """
-    n = hmm_model.n_components
-    feat = extract_boundary_features(polygon, sigma=sigma)
-    if feat is None or len(feat) < 2:
-        return np.zeros(hmm_feature_dim(n), dtype=np.float32)
-    X = scaler.transform(feat)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        states = hmm_model.predict(X)
-    if apply_state_smoothing:
-        states = median_filter_states(states, w=median_w)
-        states = enforce_min_run_length(states, min_len=min_run)
-    return _hmm_sequence_features(states, n)
-
-
-# --------------------------------------------------------------------------- #
 # Shape features (2D regionprops + 5 derived)                                #
 # --------------------------------------------------------------------------- #
 
@@ -470,68 +181,43 @@ def extract_shape_features(instances_4d):
 # Combined morphology extraction                                              #
 # --------------------------------------------------------------------------- #
 
-def extract_cell_morphology(
-    instances_4d,
-    polygons,
-    hmm_model,
-    scaler,
-    n_states:              int   = 4,
-    sigma:                 float = 2.0,
-    apply_state_smoothing: bool  = True,
-    median_w:              int   = 3,
-    min_run:               int   = 3,
-):
-    """Combine HMM features and shape features per cell per timepoint.
+def extract_cell_morphology(instances_4d, polygons=None):
+    """Per-cell 2D shape-feature readout per timepoint (Z-max projection).
+
+    Standalone morphology / QC utility — NOT wired into the segmentation or
+    tracking pipelines (see the module note). The former HMM boundary-state
+    features have been removed; this now returns shape features plus the
+    cell's polygon when one is supplied.
 
     Args:
-        instances_4d:          [T, Z, H, W] label array
-        polygons:              output of labels_to_polygons()
-        hmm_model:             fitted HMM from fit_boundary_hmm()
-        scaler:                StandardScaler from fit_boundary_hmm()
-        n_states:              number of HMM states (must match hmm_model)
-        sigma:                 boundary smoothing sigma
-        apply_state_smoothing: smooth raw HMM state sequence before feature extraction
-        median_w:              mode-filter window width
-        min_run:               minimum run length to keep (shorter runs are merged)
+        instances_4d: [T, Z, H, W] label array
+        polygons:     optional output of labels_to_polygons(); when provided the
+                      cell's polygon is attached alongside its shape features.
 
     Returns:
         morphology: dict {t: {cell_id: {
-            'hmm_feats':   np.ndarray [hmm_feature_dim(n_states)]
-                           — proportions + transition matrix + run-length stats,
-            'shape_feats': np.ndarray [18]
+            'shape_feats': np.ndarray [18],
+            'polygon':     shapely.Polygon or None,
         }}}
     """
     T = instances_4d.shape[0]
     shape_feats_all = extract_shape_features(instances_4d)
-    n_shape   = len(SHAPE_FEATURE_NAMES)
-    n_hmm     = hmm_feature_dim(n_states)
+    n_shape = len(SHAPE_FEATURE_NAMES)
 
     morphology = {}
     for t in range(T):
         morphology[t] = {}
-        polys_t  = polygons.get(t, {})
+        polys_t  = polygons.get(t, {}) if polygons is not None else {}
         shape_t  = shape_feats_all.get(t, {})
         cell_ids = set(polys_t.keys()) | set(shape_t.keys())
 
         for cell_id in cell_ids:
-            poly = polys_t.get(cell_id)
-            hmm_feats = (
-                assign_boundary_hmm_features(
-                    poly, hmm_model, scaler, sigma,
-                    apply_state_smoothing=apply_state_smoothing,
-                    median_w=median_w, min_run=min_run,
-                )
-                if poly is not None
-                else np.zeros(n_hmm, dtype=np.float32)
-            )
-
             shape = shape_t.get(cell_id)
             if shape is None:
                 shape = np.zeros(n_shape, dtype=np.float32)
-
             morphology[t][cell_id] = {
-                'hmm_feats':   hmm_feats,
                 'shape_feats': shape.astype(np.float32),
+                'polygon':     polys_t.get(cell_id),
             }
 
     return morphology

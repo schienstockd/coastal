@@ -40,6 +40,12 @@ dev = [
 notebooks = [
     "btrack",
 ]
+# Interactive viewers (coastal.napari_viz). napari is lazily imported — only needed when you call
+# show_images/show_segmentation/show_tracks. Needs a display (Qt); mirrors cecelia's napari stack.
+napari = [
+    "napari>=0.7",
+    "pyqt5>=5.15",
+]
 
 [tool.setuptools]
 packages = ["coastal"]

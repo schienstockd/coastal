@@ -40,7 +40,7 @@ cvxopt = ">=1.3.1"
 [pypi-dependencies]
 # coastal itself, editable, WITH its dev + notebook extras — this is what drags in torch, opencv,
 # scikit-image, btrack, pytest, jupyter glue, … all pinned in pyproject.toml (the single source).
-coastal = { path = ".", editable = true, extras = ["dev", "notebooks"] }
+coastal = { path = ".", editable = true, extras = ["dev", "notebooks", "napari"] }
 # cecelia's light IO helpers (zarr/OME/dim utils + the vendored btrack cell_config.json), editable
 # from the sibling checkout. This packages `scripts/link_cecelia.sh` into the env declaratively:
 # `pixi install` links it and keeps it linked across re-solves (a manual `pip install -e` would get

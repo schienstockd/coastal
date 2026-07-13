@@ -82,9 +82,10 @@ See also:
   do not add a code path that silently assumes GT masks exist.
 - **Git: never commit or push to `main` — branch + PR.** Ask before every commit and push
   (explicitly, each time; a "do the work" yes is not a commit/push yes), and volunteer honest
-  reservations first. `gh` isn't installed → push the branch and relay the PR-create URL + a
-  paste-ready body. Note this package **cannot be run in this environment** (no torch/GPU/data), so
-  most changes are unverified end-to-end — say so. Full workflow: `docs/DEV.md`.
+  reservations first. `gh` **is** installed → open the PR with `gh pr create` and relay its URL.
+  The package **can** be built and tested via the pixi env (`pixi run test`) on this GPU box — but
+  training / segmentation / tracking on real microscopy data is still unverified, so say what you
+  did and did not exercise. Full workflow: `docs/DEV.md`.
 
 ## Running
 

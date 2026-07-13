@@ -83,12 +83,12 @@ If any reservation is material, pause for Dominik's call; if there are genuinely
 Open a PR against `main`; **Dominik reviews and merges**. An agent **asks first** (golden rule)
 before pushing the branch.
 
-- The `gh` CLI is **not installed** in the agent environment. An agent therefore **pushes the
-  branch and relays the PR-creation URL**
-  (`https://github.com/schienstockd/coastal/compare/main...<branch>?expand=1`, or the
-  `pull/new/<branch>` link git prints) — it does not attempt `gh pr create`.
-- **Always relay a complete, paste-ready PR body** — for every branch — inside a fenced
-  ` ```markdown ` code block (so links survive copy-paste), ending with:
+- The `gh` CLI **is installed**. An agent opens the PR directly with `gh pr create` (write the body
+  to a scratchpad file to avoid shell-escaping) and **relays the returned PR URL**. If `gh` is ever
+  unavailable, fall back to pushing the branch and relaying the
+  `https://github.com/schienstockd/coastal/compare/main...<branch>?expand=1` URL with the body in a
+  fenced ` ```markdown ` code block.
+- **Always write a complete PR body** — for every branch — ending with:
 
   ```
   🤖 Generated with [Claude Code](https://claude.com/claude-code)
@@ -96,7 +96,8 @@ before pushing the branch.
 
 ```bash
 git push -u origin <type>/<slug>
-# relay the compare/PR URL git prints
+gh pr create --base main --head <type>/<slug> --title "<type>: <summary>" --body-file <body.md>
+# relay the PR URL gh prints
 ```
 
 ## CI

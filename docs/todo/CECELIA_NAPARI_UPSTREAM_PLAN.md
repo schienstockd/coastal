@@ -1,8 +1,9 @@
 # Cecelia napari-utils upstream
 
-Status: **paused** — execute during the planned cecelia napari work (after cecelia's
-`feat/umap-facet` lands and its tree is clean). This plan lives in the **coastal** repo but the work
-happens in the **cecelia** repo; hand it to a cecelia session (see *Handoff*).
+Status: **DONE (2026-07-13).** Shipped `cecelia.utils.napari_utils` (generic `add_image`/`add_labels`/
+`add_tracks` + `set_contrast_from_sample`); cecelia's `napari_bridge.py` delegates its `add_*` calls to
+it, and **coastal `napari_viz.py` imports and delegates to it** (not a parallel impl — see the revised
+Decision 4 below). Promote the durable "how it works" into a permanent doc when convenient.
 
 ## Goal
 
@@ -18,9 +19,13 @@ coastal PR #7) and cecelia's bridge render identically.
 
 ## Context / why the import boundary matters
 
-- coastal's package source **must not import cecelia** (coastal cross-cutting rule) — so
-  `coastal/napari_viz.py` stays as coastal's own parallel implementation. Alignment with cecelia is
-  by **shared conventions (documented), not shared code**.
+- **CORRECTED (2026-07-13, maintainer):** coastal DOES use cecelia — the notebooks import cecelia's IO
+  helpers, and cecelia is installed editable in coastal's env. The whole point of a *generic*
+  `napari_utils` is that coastal **imports and shares** it, not mirrors it. So `coastal/napari_viz.py`
+  delegates its `add_*` calls to `cecelia.utils.napari_utils` (single source of truth). The cecelia
+  import is **lazy (call-time)**, so `import coastal` stays cecelia-free — the coastal package still
+  imports fine without cecelia; only calling `show_*` needs it (same as the notebooks). The original
+  "coastal must not import cecelia / stay parallel" framing below was wrong and is superseded.
 - cecelia's **importable** package is the light IO tier (`pip install cecelia` pulls no napari —
   napari is an *environment* dep in cecelia's `pixi.toml`). So the new module ships in the wheel but
   must **lazily import napari** (napari provided by the pixi env), like cecelia's other heavy modules.
@@ -40,11 +45,12 @@ coastal PR #7) and cecelia's bridge render identically.
    columns (categorical Okabe–Ito / continuous viridis), timestamp, scale-bar, axis labels — and
    delegates only the final `self._viewer.add_*` calls to `napari_utils`. Do **not** move state into
    the generic layer.
-4. **coastal stays parallel.** `coastal/napari_viz.py` is not changed to import cecelia (would break
-   the no-cecelia-in-coastal rule). If cecelia's helpers drift from coastal's, align the conventions,
-   not the code. (Maintainer's-call alternative: make coastal's viz notebook-only glue and switch
-   the notebook to `from cecelia.utils.napari_utils import ...`; not recommended — it couples the
-   coastal notebook's viz to cecelia.)
+4. **coastal SHARES cecelia's helpers (REVISED 2026-07-13, maintainer's call).** `coastal/napari_viz.py`
+   imports `cecelia.utils.napari_utils` and delegates its `add_*` calls to it (lazy/call-time), keeping
+   only coastal-specific orchestration (viewer setup, `_prep_image`, `tracks_to_matrix`). This is the
+   whole point of the generic layer — one source of truth, no duplicated convention logic — and matches
+   coastal already importing cecelia's IO helpers. (The earlier "stay parallel, align by conventions"
+   plan is superseded.)
 
 ## Conventions to preserve (both repos)
 

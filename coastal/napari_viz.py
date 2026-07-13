@@ -1,36 +1,29 @@
 """napari viewers for the pipeline stages: raw images, segmentation, tracks.
 
-napari is an **optional, lazily-imported** dependency (install ``coastal[napari]`` or use the pixi
-env) — this module is never imported at package import time, and calling a helper without napari
-raises a clear message. Conventions mirror cecelia's napari bridge so coastal overlays look and
-align the same as cecelia's project viewer:
+The napari layer conventions live ONCE in cecelia (`cecelia.utils.napari_utils`) — coastal imports and
+delegates to them, so coastal renders identically to cecelia's project viewer without duplicating the
+convention logic (per-channel colormaps + additive blending, labels at ``opacity=0.7``, track
+colour/tail params, contrast-from-sample). coastal already depends on cecelia's IO helpers and installs
+cecelia editable in its env (see pixi.toml), so this is the same coupling, extended to display.
 
-  - anisotropic ``scale`` from ``pix_res`` (so Z / XY are physically correct),
-  - one image layer per channel with per-channel colormaps + additive blending,
-  - ``labels`` at ``opacity=0.7``,
-  - tracks as an ``[track_id, t, z, y, x]`` matrix in **pixel** coords, with ``scale`` supplying the
-    µm conversion (coastal tracks are in µm, so vertices = ``pos_um / [z, y, x]``),
-  - ``color_by='track_id'`` with the ``turbo`` colormap.
+coastal never imports **napari** directly — it goes through cecelia too: ``napari_utils.new_viewer()``
+creates the viewer and ``require_napari()`` (inside the helpers) raises a clear message if napari is
+absent. cecelia + napari are imported LAZILY inside the functions, so ``import coastal`` stays
+dependency-light (numpy only) — they're pulled only when you actually call ``show_*``.
 
-Each ``show_*`` helper returns the napari ``Viewer`` (creating one if none is passed) so the stages
-can be layered into a single viewer.
+What stays here is coastal-specific *orchestration*: reusing/creating the viewer, unpacking coastal's
+array shapes (`_prep_image`), and converting coastal's µm track dict to napari's pixel matrix
+(`tracks_to_matrix`). The generic ``add_image`` / ``add_labels`` / ``add_tracks`` calls are delegated.
+
+Each ``show_*`` helper returns the napari ``Viewer`` (creating one if none is passed) so the stages can
+be layered into a single viewer.
 """
 
 import numpy as np
 
-# Default confetti-ish per-channel colormaps (extend if a movie has >4 channels).
+# Default per-channel colormaps (extend if a movie has > 4 channels). Mirrors
+# cecelia.utils.napari_utils.CHANNEL_COLORMAPS — kept here as coastal's own choice of channel order.
 CHANNEL_COLORMAPS = ['red', 'green', 'blue', 'yellow']
-
-
-def _require_napari():
-    try:
-        import napari
-    except ImportError as e:  # pragma: no cover - environment-dependent
-        raise ImportError(
-            "napari is required for coastal.napari_viz — install `coastal[napari]` or use the "
-            "pixi env (it ships napari + pyqt)."
-        ) from e
-    return napari
 
 
 def _scale_tzyx(pix_res):
@@ -39,7 +32,7 @@ def _scale_tzyx(pix_res):
 
 
 def _prep_image(image, ch_indices):
-    """Return (data, channel_axis) for napari.add_image from a [T,C,Z,Y,X] or [T,Z,Y,X] array."""
+    """Return (data, channel_axis) for napari from a [T,C,Z,Y,X] or [T,Z,Y,X] array."""
     vol = np.asarray(image)
     if vol.ndim == 5:                       # [T, C, Z, Y, X]
         if ch_indices is not None:
@@ -62,17 +55,15 @@ def show_images(image, pix_res, ch_indices=None, channel_names=None, viewer=None
 
     Returns the napari.Viewer.
     """
-    napari = _require_napari()
-    v = viewer if viewer is not None else napari.Viewer()
+    from cecelia.utils import napari_utils
+    v = viewer if viewer is not None else napari_utils.new_viewer()
     data, channel_axis = _prep_image(image, ch_indices)
-    scale = _scale_tzyx(pix_res)
-    if channel_axis is not None:
-        n_ch = data.shape[channel_axis]
-        v.add_image(data, channel_axis=channel_axis, scale=scale,
-                    name=channel_names, colormap=CHANNEL_COLORMAPS[:n_ch] or None,
-                    blending='additive')
-    else:
-        v.add_image(data, scale=scale, name=(channel_names or 'image'))
+    n_ch = data.shape[channel_axis] if channel_axis is not None else 1
+    napari_utils.add_image(
+        v, data, scale=_scale_tzyx(pix_res), channel_axis=channel_axis,
+        channel_names=(channel_names if channel_axis is not None else (channel_names or 'image')),
+        colormaps=(CHANNEL_COLORMAPS[:n_ch] or None) if channel_axis is not None else None,
+    )
     return v
 
 
@@ -81,9 +72,9 @@ def show_segmentation(image, instances, pix_res, ch_indices=None, channel_names=
 
     ``instances`` is a [T, Z, Y, X] integer label array (0 = background).
     """
-    napari = _require_napari()
+    from cecelia.utils import napari_utils
     v = show_images(image, pix_res, ch_indices=ch_indices, channel_names=channel_names, viewer=viewer)
-    v.add_labels(np.asarray(instances), name='segmentation', scale=_scale_tzyx(pix_res), opacity=0.7)
+    napari_utils.add_labels(v, np.asarray(instances), scale=_scale_tzyx(pix_res), name='segmentation')
     return v
 
 
@@ -119,19 +110,18 @@ def show_tracks(tracks, pix_res, instances=None, image=None, ch_indices=None,
 
     Returns the napari.Viewer.
     """
-    napari = _require_napari()
+    from cecelia.utils import napari_utils
     v = viewer
     if image is not None:
         v = show_images(image, pix_res, ch_indices=ch_indices, viewer=v)
     if instances is not None:
-        v = v if v is not None else napari.Viewer()
-        v.add_labels(np.asarray(instances), name='segmentation', scale=_scale_tzyx(pix_res), opacity=0.7)
+        v = v if v is not None else napari_utils.new_viewer()
+        napari_utils.add_labels(v, np.asarray(instances), scale=_scale_tzyx(pix_res), name='segmentation')
     if v is None:
-        v = napari.Viewer()
+        v = napari_utils.new_viewer()
 
     data = tracks_to_matrix(tracks, pix_res, min_track_len=min_track_len)
     # scale spans (t, z, y, x); vertices are in pixels so scale supplies the µm conversion.
-    v.add_tracks(data, name='tracks', scale=_scale_tzyx(pix_res),
-                 color_by='track_id', colormap='turbo', tail_width=4, tail_length=30,
-                 blending='additive')
+    napari_utils.add_tracks(v, data, scale=_scale_tzyx(pix_res), name='tracks',
+                            color_by='track_id', colormap='turbo', tail_width=4, tail_length=30)
     return v

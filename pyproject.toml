@@ -40,8 +40,11 @@ dev = [
 notebooks = [
     "btrack",
 ]
-# Interactive viewers (coastal.napari_viz). napari is lazily imported — only needed when you call
-# show_images/show_segmentation/show_tracks. Needs a display (Qt); mirrors cecelia's napari stack.
+# Interactive viewers (coastal.napari_viz). napari AND cecelia are lazily imported — only needed when
+# you call show_images/show_segmentation/show_tracks (so `import coastal` stays cecelia-free; the glue
+# calls it at call-time, like the notebooks). Those show_* helpers DELEGATE the layer conventions to
+# cecelia.utils.napari_utils (single source of truth), so coastal renders like cecelia's viewer. Needs
+# a display (Qt) + the editable cecelia dep (see the notebooks extra).
 napari = [
     "napari>=0.7",
     "pyqt5>=5.15",

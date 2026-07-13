@@ -349,7 +349,7 @@ def track_sequence(
     w_flow:              float = 0.0,
     w_color:             float = 0.0,
     color_ema:           float = 0.9,
-    device:              str   = 'cuda',
+    device:              str   = None,
     swap_lookahead:      int   = 0,
     return_margins:      bool  = False,
     return_swap_log:     bool  = False,

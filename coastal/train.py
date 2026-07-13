@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from coastal.model import UNetWithEmbeddings
 from coastal.loss import IntensityLoss, TemporalMetricsLoss, VarianceMetricsLoss, WarpConsistencyLoss
+from coastal.device import resolve_device
 
 
 class TemporalDatasetWithAugmentation(Dataset):
@@ -196,7 +197,7 @@ def train_test_split_per_movie(all_frames, all_metrics, train_ratio=0.8, shuffle
 
 
 def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm=None,
-                       num_epochs=50, batch_size=1, seed=42, device='cuda', embedding_dim=16,
+                       num_epochs=50, batch_size=1, seed=42, device=None, embedding_dim=16,
                        variance_weight=1.0, intensity_weight=1.0, temporal_weight=2.0,
                        warp_weight=0.0, flow_pairs=None,
                        max_grad_norm=1.0, variance_window_size=32, variance_dropout_p=0.5,
@@ -227,6 +228,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     torch.manual_seed(seed)
     np.random.seed(seed)
 
+    device = resolve_device(device)
     use_variance = variance_metrics_norm is not None
     use_amp = use_amp and device != 'cpu' and torch.cuda.is_available()
 
@@ -433,16 +435,17 @@ def save_model(model, path, metadata=None):
     print(f"Model saved to {path}")
 
 
-def load_model(path, device='cuda'):
+def load_model(path, device=None):
     """Load a model saved with save_model().
 
     Args:
         path:   path to the .pt file
-        device: device to load the model onto
+        device: torch device; None/'auto' → cuda→mps→cpu (see coastal.device.resolve_device)
 
     Returns:
         model: UNetWithEmbeddings in eval mode
     """
+    device = resolve_device(device)
     checkpoint = torch.load(path, map_location=device)
     cfg = checkpoint['model_config']
     model = UNetWithEmbeddings(

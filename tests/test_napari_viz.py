@@ -5,9 +5,62 @@ track-matrix conversion (µm → pixel, the [track_id, t, z, y, x] layout napari
 module must import without napari installed (lazy import).
 """
 
+import os
+
 import numpy as np
 
-from coastal.napari_viz import tracks_to_matrix, _scale_tzyx
+from coastal.napari_viz import tracks_to_matrix, _scale_tzyx, _prep_image, _fix_qt_plugin_path
+
+
+def test_fix_qt_plugin_path_drops_cv2_path_keeps_others():
+    prev = os.environ.get('QT_QPA_PLATFORM_PLUGIN_PATH')
+    try:
+        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = '/x/site-packages/cv2/qt/plugins'
+        _fix_qt_plugin_path()
+        assert 'QT_QPA_PLATFORM_PLUGIN_PATH' not in os.environ   # cv2 path removed → PyQt5 plugins win
+
+        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = '/opt/qt/plugins'
+        _fix_qt_plugin_path()
+        assert os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] == '/opt/qt/plugins'  # legit path untouched
+    finally:
+        os.environ.pop('QT_QPA_PLATFORM_PLUGIN_PATH', None)
+        if prev is not None:
+            os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = prev
+
+
+class _NoMaterialise:
+    """Array-like that refuses to become a numpy array — proves _prep_image never forces a load.
+
+    A confetti movie is multiple GB; _prep_image must pass a lazy (dask) array straight through to
+    napari, which slices on demand. If _prep_image ever calls np.asarray() again, __array__ fires.
+    """
+
+    def __init__(self, shape):
+        self.shape = tuple(shape)
+        self.ndim = len(self.shape)
+
+    def __getitem__(self, idx):
+        # emulate lazy channel slicing vol[:, [..]] -> narrower channel axis, still lazy
+        ch = idx[1]
+        new = list(self.shape)
+        new[1] = len(ch)
+        return _NoMaterialise(new)
+
+    def __array__(self, *a, **k):
+        raise AssertionError("_prep_image materialised a lazy array (called np.asarray)")
+
+
+def test_prep_image_keeps_lazy_arrays_lazy():
+    data, channel_axis = _prep_image(_NoMaterialise((180, 4, 12, 540, 516)), ch_indices=[1, 2, 3])
+    assert channel_axis == 1
+    assert data.shape[1] == 3                       # channel selection applied, still lazy
+
+
+def test_prep_image_channel_axis_and_slice_numpy():
+    data, channel_axis = _prep_image(np.zeros((2, 4, 3, 6, 6)), ch_indices=[1, 3])
+    assert channel_axis == 1 and data.shape[1] == 2
+    data, channel_axis = _prep_image(np.zeros((2, 3, 6, 6)), ch_indices=None)
+    assert channel_axis is None and data.shape == (2, 3, 6, 6)
 
 
 def test_scale_tzyx_puts_zyx_in_order_with_unit_time():

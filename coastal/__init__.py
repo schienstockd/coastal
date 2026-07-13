@@ -3,6 +3,7 @@
 __version__ = "0.1.0"
 
 from coastal.device import resolve_device
+from coastal.napari_viz import show_images, show_segmentation, show_tracks, tracks_to_matrix
 from coastal.model import UNetWithEmbeddings
 from coastal.loss import IntensityLoss, TemporalMetricsLoss, VarianceMetricsLoss, WarpConsistencyLoss
 from coastal.train import (
@@ -50,6 +51,10 @@ from coastal.abm import (
 
 __all__ = [
     "resolve_device",
+    "show_images",
+    "show_segmentation",
+    "show_tracks",
+    "tracks_to_matrix",
     "UNetWithEmbeddings",
     "IntensityLoss",
     "TemporalMetricsLoss",

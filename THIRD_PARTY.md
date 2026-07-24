@@ -4,8 +4,9 @@
 
 `coastal/denoise.py` reimplements the **CPnet** network and the normalization / tiling / stitching
 inference harness from **Cellpose 3**, and loads Cellpose's **public pretrained restoration
-weights** (`denoise_cyto3`, `deblur_cyto3`, `upsample_cyto3`, and nuclei/cyto2 variants), downloaded
-from <https://www.cellpose.org/models> on first use.
+weights** (the **denoise** models — `denoise_cyto3`, `denoise_cyto2`, `denoise_nuclei`), downloaded
+from <https://www.cellpose.org/models> on first use. (Cellpose 3 also publishes deblur/upsample
+restoration weights; coastal ships denoise only.)
 
 - **Upstream:** Cellpose — <https://github.com/MouseLand/cellpose>
 - **License:** BSD-3-Clause

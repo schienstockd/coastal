@@ -35,6 +35,10 @@ dev = [
     "pytest",
     "black",
     "flake8",
+    # TEST-ONLY: the denoise golden test asserts coastal.denoise matches cellpose 3 output on a
+    # fixture. cellpose is NEVER a runtime dependency of coastal (see coastal/denoise.py header and
+    # docs/todo/DENOISE_PLAN.md) — it is imported only by tests/test_denoise.py, which skips if absent.
+    "cellpose==3.1.1.2",
 ]
 # Notebook glue only — the coastal/ package itself stays array-only (no cecelia/zarr/btrack
 # imports). The demo notebooks additionally need:

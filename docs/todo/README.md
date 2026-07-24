@@ -38,6 +38,11 @@ If it fits in a paragraph and needs no design, it's a `docs/TODO.md` item, not a
 
 ## Current parked plans
 
+- [`DENOISE_PLAN.md`](DENOISE_PLAN.md) — give coastal a denoising/restoration module: **Part A**
+  extract Cellpose 3 restoration (reference, not dependency) so cecelia can drop the `cellpose==3`
+  pin and move to Cellpose 4; **Part B** repurpose motion-compensated self-supervised *video*
+  denoising for slow-cadence (≤15 s) 3D+T intravital, gated by optical-flow magnitude. Redundancy
+  validated on `zolIMa/ldYr8J` (median ~1 px/frame motion). Planning.
 - [`CECELIA_NAPARI_UPSTREAM_PLAN.md`](CECELIA_NAPARI_UPSTREAM_PLAN.md) — extract coastal's napari
   viz helpers (`coastal/napari_viz.py`) into a generic `cecelia/utils/napari_utils.py` and have
   cecelia's `napari_bridge.py` delegate to it. **Work happens in the cecelia repo** — hand this

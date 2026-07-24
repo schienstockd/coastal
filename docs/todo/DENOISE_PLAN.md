@@ -63,7 +63,17 @@ Confirmed from the installed metadata:
    assumption, not a new burden. We do **not** optimise for high-motion movies.
 8. **coastal graduates from "dropped" to a shipping dependency** as a git or PyPI dep (not the
    editable non-git sibling-path that got it dropped — see cecelia `docs/SHIPPING.md` "coastal is
-   dropped for now"). Blocks the pin removal shipping cleanly; resolve early.
+   dropped for now").
+   **RESOLVED (2026-07-24):** coastal is **not rc-ready — dev-only for now**, so cecelia pulls it as a
+   git dep **tracking `main`** (`coastal = { git = "https://github.com/schienstockd/coastal.git",
+   branch = "main" }`); switch to a `tag` pin once coastal cuts a release. Local co-dev uses an
+   editable shadow (`pixi run pip install -e ../../coastal`), which keeps `pixi run dev` unchanged.
+   **Consequence:** making the *shipped* cecelia cleanup hard-depend on coastal + dropping the
+   `cellpose==3` pin (Part A A4/A5, and the Cellpose-4 segmentation migration it unblocks) is **gated
+   on a coastal release** — deferred, since it would tie cecelia releases to unreleased coastal. Until
+   then the **`coastalDenoise` dev custom module** (sys.path shim to `~/cc-workspace/coastal`) is the
+   way to use coastal denoise; no cecelia `pixi.toml` change / pin drop yet. Fallback if coastal never
+   releases: vendor `coastal.denoise` into cecelia (reintroduces the duplication we avoided).
 
 ---
 
@@ -223,15 +233,40 @@ stress cases), not just the easy nuclear channel.
   failure) and avoids warp-corrupting the static majority (the global-flow failure).
 - **Cadence contract**: document ≤ ~15 s as a requirement (Decision 7).
 
+### Methodology — heed coastal's own dead ends (`docs/DEAD_ENDS.md`)
+This is an **experiment, not a scheduled feature** — treat it like the tracking work, which killed a
+long list of elaborate methods (ABM tracker, learned `w_app` embeddings, collective-motion cost, HMM
+boundary states) because each **added complexity without beating a simple robust baseline**. Apply
+the same discipline here:
+- **Baseline-first.** Stand up the simplest self-supervised temporal denoiser and the two trivial
+  baselines (per-frame denoise; Cellpose-3 restoration) *before* any motion-compensation cleverness.
+  Motion comp (B2) must *earn* its place against the plain temporal baseline, or it's ruled out.
+- **One credible signal to build on:** the tracking work *kept* `w_flow` (dense flow-warp) — flow is
+  reliable enough to warp frames — so flow-guided temporal alignment is a reasonable bet, but still
+  gated on measured gain.
+- **Honest eval without clean ground truth.** No clean target exists, so PSNR-vs-GT is out. Use:
+  (1) **held-out-frame self-supervised loss** (predict a left-out frame from neighbours — the N2N
+  validation signal); (2) a **downstream proxy** — does denoising improve segmentation/tracking
+  scores (coastal already has `score_tracking`)?; (3) qualitative check that **moving cells aren't
+  smeared** (the exact failure mode of DeepCAD-RT et al.). A method that wins (1) but smears cells
+  (fails 3) is ruled out.
+- **Log negatives.** Keep a running experiment log (like `TRACKING_SESSION_SUMMARY.md`) so a tried
+  approach is *recorded as ruled out*, not silently re-tried.
+- **Expectations:** no miracle on a one-week horizon; the deliverable of B1 is a *measured* baseline
+  + a go/no-go read, not a shipped denoiser.
+
 ### Part B phases
 - **B0 — DONE (2026-07-24)** — ~1 px/frame redundancy confirmed across all 12 `OLifi6` images
   (see the set-wide table above); locked as the design assumption.
-- **B1** — self-supervised spatiotemporal baseline (no motion comp), trained on `zolIMa` moving
-  channels; compare vs per-frame denoise + vs Cellpose-3 restoration.
-- **B2** — add the flow-gated motion-compensation branch; ablate the gate (measure the tail win,
-  confirm no static-region regression).
-- **B3** — promote to a permanent `coastal/docs/SEGMENTATION.md`-style area doc; wire an optional
-  temporal mode into cecelia's cleanup task.
+- **B1** — self-supervised spatiotemporal baseline (**no** motion comp). Reuse coastal's training
+  infra (`train.py`, `TemporalDatasetWithAugmentation`, AMP); train on `zolIMa`/`OLifi6` moving
+  channels (validate on the stress cases: mem-TOM, movies `2yvS9D`/`YOXLrK`). Compare vs per-frame
+  denoise + Cellpose-3 restoration on the eval signals above. **Output: a go/no-go, not a feature.**
+- **B2** — *only if B1 shows temporal redundancy is being left on the table* — add the flow-gated
+  motion-compensation branch; ablate the gate (measure the tail win, confirm no static-region
+  regression — global warp HURT PSNR at near-zero motion, per B0).
+- **B3** — *only if B1/B2 clear the bar* — promote to a permanent `coastal/docs/` area doc; wire an
+  optional temporal mode into cecelia's cleanup task.
 
 ---
 

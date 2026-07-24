@@ -1,4 +1,4 @@
-"""coastal.denoise — image restoration (denoise / deblur / upsample) for fluorescence microscopy.
+"""coastal.denoise — denoising for fluorescence microscopy.
 
 The network (``CPnet``) and the normalization / tiling / stitching harness are **adapted from
 Cellpose 3** (BSD-3-Clause, © 2023 Howard Hughes Medical Institute; Carsen Stringer & Marius
@@ -43,11 +43,10 @@ from coastal.device import resolve_device
 # We reuse the standard ~/.cellpose/models cache by default so a machine that already has Cellpose
 # does not re-download; override with COASTAL_MODELS_PATH or CELLPOSE_LOCAL_MODELS_PATH.
 _MODEL_URL = "https://www.cellpose.org/models"
-MODEL_NAMES = [
-    "denoise_cyto3", "deblur_cyto3", "upsample_cyto3", "oneclick_cyto3",
-    "denoise_cyto2", "deblur_cyto2", "upsample_cyto2",
-    "denoise_nuclei", "deblur_nuclei", "upsample_nuclei",
-]
+# Denoise models only. Cellpose 3 also publishes deblur_*/upsample_* restoration weights, but
+# cecelia's cleanup only needs denoising (and upsample changes the output size — incompatible with
+# the same-size correction the cleanup task writes), so we deliberately ship denoise-only.
+MODEL_NAMES = ["denoise_cyto3", "denoise_cyto2", "denoise_nuclei"]
 
 
 def _models_dir():

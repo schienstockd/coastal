@@ -2,52 +2,66 @@
 
 __version__ = "0.1.0"
 
+# --- lightweight core (torch + numpy + opencv only) -------------------------------------------
+# device + denoise deliberately import FIRST and with no heavy deps, so `import coastal.denoise`
+# works in a minimal env (e.g. cecelia's cleanup task) without pulling the segmentation/tracking
+# stack (cma, hmmlearn, shapely, sklearn, …). See coastal/denoise.py and docs/todo/DENOISE_PLAN.md.
 from coastal.device import resolve_device
-from coastal.napari_viz import show_images, show_segmentation, show_tracks, tracks_to_matrix
-from coastal.model import UNetWithEmbeddings
-from coastal.loss import IntensityLoss, TemporalMetricsLoss, VarianceMetricsLoss, WarpConsistencyLoss
-from coastal.train import (
-    train_with_metrics,
-    save_model,
-    load_model,
-    train_test_split,
-    train_test_split_per_movie,
-    prepare_data_for_unet_batch,
-    prepare_data_for_unet_batch_4d,
-    extract_sequences_from_volume,
-    TemporalDatasetWithAugmentation,
-)
-from coastal.segment import LearnedAffinityInference, TwoPassSegmentationInference, Inference3D
-from coastal.utils import match_masks_3d, intersection_over_union, filter_small_cells
-from coastal.viz import visualize_frame_segmentation, plot_rgb_with_segmentation
-from coastal.flow import prepare_data_for_unet, compute_variance_metrics, VarianceMetricsConfig, normalize_and_project, extract_dense_flow_pairs
-from coastal.data import prepare_training_data, validate_training_data
-from coastal.optimize import (
-    optimize_segmentation_cma,
-    score_segmentation,
-    optimize_tracking_cma,
-    score_tracking_scalar,
-    TRACKING_PARAM_BOUNDS,
-)
-from coastal.morphology import (
-    labels_to_polygons,
-    extract_shape_features,
-    extract_cell_morphology,
-    SHAPE_FEATURE_NAMES,
-)
-from coastal.track import (
-    Track,
-    compute_3d_centroids,
-    extract_cell_colors,
-    extract_cell_intensities,
-)
-from coastal.abm import (
-    compute_cell_flows,
-    compute_cell_flow_features,
-    track_sequence,
-    stitch_tracklets,
-    score_tracking,
-)
+from coastal.denoise import DenoiseModel, denoise_image
+
+# --- full package (segmentation / tracking / optimization) ------------------------------------
+# Guarded so a denoise-only install (without the heavy optional deps) can still `import coastal`.
+# In a full install these all import normally; a missing optional dep only removes that feature,
+# not the denoise entry point.
+try:
+    from coastal.napari_viz import show_images, show_segmentation, show_tracks, tracks_to_matrix
+    from coastal.model import UNetWithEmbeddings
+    from coastal.loss import IntensityLoss, TemporalMetricsLoss, VarianceMetricsLoss, WarpConsistencyLoss
+    from coastal.train import (
+        train_with_metrics,
+        save_model,
+        load_model,
+        train_test_split,
+        train_test_split_per_movie,
+        prepare_data_for_unet_batch,
+        prepare_data_for_unet_batch_4d,
+        extract_sequences_from_volume,
+        TemporalDatasetWithAugmentation,
+    )
+    from coastal.segment import LearnedAffinityInference, TwoPassSegmentationInference, Inference3D
+    from coastal.utils import match_masks_3d, intersection_over_union, filter_small_cells
+    from coastal.viz import visualize_frame_segmentation, plot_rgb_with_segmentation
+    from coastal.flow import prepare_data_for_unet, compute_variance_metrics, VarianceMetricsConfig, normalize_and_project, extract_dense_flow_pairs
+    from coastal.data import prepare_training_data, validate_training_data
+    from coastal.optimize import (
+        optimize_segmentation_cma,
+        score_segmentation,
+        optimize_tracking_cma,
+        score_tracking_scalar,
+        TRACKING_PARAM_BOUNDS,
+    )
+    from coastal.morphology import (
+        labels_to_polygons,
+        extract_shape_features,
+        extract_cell_morphology,
+        SHAPE_FEATURE_NAMES,
+    )
+    from coastal.track import (
+        Track,
+        compute_3d_centroids,
+        extract_cell_colors,
+        extract_cell_intensities,
+    )
+    from coastal.abm import (
+        compute_cell_flows,
+        compute_cell_flow_features,
+        track_sequence,
+        stitch_tracklets,
+        score_tracking,
+    )
+except ImportError as _e:  # denoise-only install: heavy seg/tracking deps absent → skip, keep denoise
+    import warnings as _warnings
+    _warnings.warn(f"coastal: segmentation/tracking API unavailable ({_e}); denoise entry point still works.")
 
 __all__ = [
     "resolve_device",

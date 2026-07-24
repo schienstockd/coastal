@@ -361,7 +361,8 @@ class DenoiseModel:
         """Restore a 2-D plane ``(Y, X)`` or a stack ``(Z, Y, X)`` of grayscale planes.
 
         Each plane is normalized (1/99 percentile) and restored independently — matching how
-        cecelia's cleanup task feeds planes. Returns float32 of the same spatial shape
+        cecelia's cleanup task feeds planes. Returns float32; same spatial shape as the input for
+        denoise/deblur, or upscaled by diam_mean/diameter for an ``upsample`` model
         (Cellpose restoration range ~[-1, 10]).
         """
         x = np.asarray(x)
@@ -370,26 +371,37 @@ class DenoiseModel:
             x = x[np.newaxis]           # (1, Y, X)
         Lz, Ly0, Lx0 = x.shape
 
+        # Upsample models first interpolate the image UP to diam_mean pixel diameter
+        # (ratio = diam_mean/diameter, only when 3 <= diameter < diam_mean) and the restored output
+        # STAYS at that upsampled size. denoise/deblur keep ratio 1.0 (output == input size). This
+        # mirrors cellpose DenoiseModel.eval's upsample branch.
+        ratio = 1.0
+        if "upsample" in self.model_type and diameter is not None and 3 <= diameter < self.diam_mean:
+            ratio = self.diam_mean / diameter
+        out_Ly, out_Lx = int(Ly0 * ratio), int(Lx0 * ratio)
+
         rescale = 1.0
         if diameter is not None and diameter > 0:
             rescale = self.diam_mean / diameter
 
-        planes = np.empty((Lz, Ly0, Lx0), np.float32)
+        # Per plane: pre-interpolate (upsample only) BEFORE normalizing, at the working/output size.
+        planes = np.empty((Lz, out_Ly, out_Lx), np.float32)
         for z in range(Lz):
-            p = x[z]
+            p = np.asarray(x[z], dtype=np.float32)
+            if ratio != 1.0:
+                p = _resize(p, out_Ly, out_Lx)
             if normalize and np.ptp(p) > 0:
                 p = normalize99(p)
-            else:
-                p = p.astype(np.float32, copy=True)
             planes[z] = p
-        if rescale != 1.0:
-            Lyr, Lxr = int(Ly0 * rescale), int(Lx0 * rescale)
-            planes = np.stack([_resize(planes[z], Lyr, Lxr) for z in range(Lz)])
 
-        out = self._forward(planes[..., np.newaxis], batch_size, autocast)  # (Lz,Ly,Lx,1)
-        out = out[..., 0]
+        work = planes
         if rescale != 1.0:
-            out = np.stack([_resize(out[z], Ly0, Lx0) for z in range(Lz)])
+            Lyr, Lxr = int(out_Ly * rescale), int(out_Lx * rescale)
+            work = np.stack([_resize(planes[z], Lyr, Lxr) for z in range(Lz)])
+
+        out = self._forward(work[..., np.newaxis], batch_size, autocast)[..., 0]  # (Lz, ·, ·)
+        if rescale != 1.0:
+            out = np.stack([_resize(out[z], out_Ly, out_Lx) for z in range(Lz)])
         return out[0] if squeeze else out
 
 

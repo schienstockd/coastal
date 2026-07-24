@@ -80,3 +80,35 @@ def test_stack_matches_per_plane():
     batched = m.eval(stack, diameter=None)
     per_plane = np.stack([m.eval(stack[z], diameter=None) for z in range(3)])
     assert np.abs(batched - per_plane).max() < 1e-3
+
+
+def _parity(model_type, diameter):
+    """coastal vs cellpose on one image → (got, ref_out). Skips if cellpose/weights unavailable."""
+    cellpose_denoise = pytest.importorskip("cellpose.denoise")
+    try:
+        ref = cellpose_denoise.DenoiseModel(model_type=model_type, gpu=False)
+    except Exception as e:
+        pytest.skip(f"cellpose weights unavailable: {e}")
+    img = _synthetic_image()
+    ref_out = ref.eval([img], channels=[0, 0], diameter=diameter)[0][..., 0]
+    got = DenoiseModel(model_type=model_type, device="cpu").eval(img, diameter=diameter)
+    return got, ref_out
+
+
+def test_matches_cellpose_deblur():
+    """Deblur model (+ the diameter/rescale path) must match cellpose too — not just denoise."""
+    got, ref_out = _parity("deblur_cyto3", diameter=10.)
+    assert got.shape == ref_out.shape
+    corr = np.corrcoef(got.ravel(), ref_out.ravel())[0, 1]
+    assert corr > 0.9999, f"deblur correlation {corr:.5f} too low"
+    assert np.abs(got - ref_out).max() < 1e-2
+
+
+def test_matches_cellpose_upsample():
+    """Upsample model: output is upscaled by diam_mean/diameter AND matches cellpose pixel-wise."""
+    got, ref_out = _parity("upsample_cyto3", diameter=10.)   # diam_mean 30 → 3x upscale
+    assert got.shape == ref_out.shape, f"{got.shape} != cellpose {ref_out.shape}"
+    assert got.shape[0] > 256 and got.shape[1] > 256, "upsample output should be larger than input"
+    corr = np.corrcoef(got.ravel(), ref_out.ravel())[0, 1]
+    assert corr > 0.9999, f"upsample correlation {corr:.5f} too low"
+    assert np.abs(got - ref_out).max() < 1e-2

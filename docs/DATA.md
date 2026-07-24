@@ -51,12 +51,14 @@ dim_utils = DimUtils(ome_xml_utils.parse_meta(im_path), use_channel_axis=True)
 dim_utils.calc_image_dimensions(im[0].shape)
 pix_res = dim_utils.im_physical_sizes()                  # → track_sequence's pix_res dict
 
-# btrack (used in tracking.ipynb / pipeline_confetti_ceiling.ipynb) — its vendored config ships
-# inside the installed cecelia package (as package-data); locate it via importlib.resources,
-# which works for a wheel OR an editable install:
-from importlib.resources import files
-BTRACK_CONFIG = os.environ.get("BTRACK_CONFIG",
-    str(files("cecelia").joinpath("tasks", "tracking", "cell_config.json")))
+# btrack (used in tracking.ipynb / pipeline_confetti_ceiling.ipynb) — supply a btrack config path.
+# NOTE: cecelia's vendored config is NO LONGER shipped in the `cecelia` package — it moved next to
+# cecelia's tracking *task* (cecelia-pineapple/app/src/tasks/tracking/cell_config.json), which is not
+# part of the installable IO library. Point BTRACK_CONFIG at that file in a cecelia checkout, or let
+# btrack use its own default (it downloads one). These notebooks' btrack path is experimental anyway
+# — coastal's own tracker is Kalman+LAP (see TRACKING.md / DEAD_ENDS.md).
+import os
+BTRACK_CONFIG = os.environ.get("BTRACK_CONFIG")   # e.g. <cecelia>/app/src/tasks/tracking/cell_config.json
 ```
 
 These helpers are **stateless** (plain paths / numpy / dask; no cecelia project state), and this is
@@ -69,9 +71,10 @@ Caveats: this needs `cecelia` installed in the notebook kernel's env — either 
 (`pip install <cecelia-pineapple>/python`) or an editable path install
 (`pip install -e <cecelia-pineapple>/python`). The old flat `py.zarr_utils` / `CECELIA_APP`
 bootstrap is gone. cecelia's packaging design is recorded in
-`cecelia-pineapple/docs/todo/PY_PACKAGING_PLAN.md`. (The earlier rough edge — `cell_config.json` not
-shipping in the wheel — is fixed: cecelia now declares it as package-data, so the
-`importlib.resources` lookup above resolves for both wheel and editable installs.)
+`cecelia-pineapple/docs/todo/PY_PACKAGING_PLAN.md`. (Update: the installable `cecelia` package is now
+the **IO library only** — task runners and the vendored btrack `cell_config.json` live beside their
+task under `cecelia-pineapple/app/src/tasks/`, not in the wheel. So `importlib.resources` no longer
+finds `cell_config.json`; supply `BTRACK_CONFIG` explicitly as above.)
 
 ### Independent dev environment (pixi)
 

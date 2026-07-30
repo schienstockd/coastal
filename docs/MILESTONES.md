@@ -139,8 +139,18 @@ Set up `github.com/schienstockd/coastal` and the contribution standards:
     `n_good / (n_good + n_merged)`, with fragments excluded from the denominator and free unless
     `count_penalty_weight > 0`).
   - Set `merge_max_distance = 1.5` in the notebook to un-break merging. Measured effect on 5 real
-    frames: 2366 → 2277 cells (**−3.8%**), so this is *not* on its own the Y-cell-splitting fix. Full
-    re-tuning with a non-degenerate objective is Dominik's call — recorded in `docs/OPTIMIZATION.md`.
+    frames: 2366 → 2277 cells (**−3.8%**), so this is *not* on its own the Y-cell-splitting fix.
+- **Re-ran the tune with a working objective — and did not adopt the result.** With
+  `purity_threshold=0.4` and a calibrated `count_penalty_weight`, CMA-ES gets a real gradient
+  (0.02–0.28, no flat warning) and converges in ~2 min. But `affinity_threshold` pins to whatever the
+  upper bound is (0.6, then 0.8 when widened), because the score is a ratio over large cells only:
+  on a held-out TEST movie the score rose 0.429 → 0.523 while the absolute number of good cells
+  **fell 140 → 122 → 116**. It improves by discarding cells into the near-free fragment bin. The
+  bound was left at 0.6 rather than widened to chase the wall, and `BEST_PARAMS` keeps its shipped
+  values apart from `merge_max_distance`. Two prerequisite objective fixes are measured and parked in
+  `docs/TODO.md`: background-subtract purity (median 0.385 → 0.709, 34% → 90% of its range, which
+  also makes the documented 0.7 default usable) and stop maximising a ratio over a subset. Both
+  redefine "good segmentation", so the intent is Dominik's call.
 - **Measured on the box** (not estimated): peak RSS for one in-flight z-slice at T=180 went
   **~7.0 GB → 4.65 GB** (incl. the Torch/CUDA context), which lifts the notebook's `SEG_WORKERS`
   from 2 to 4 on 31 GB — with ~6 as the ceiling. Together with the loop work a 15-slice movie goes

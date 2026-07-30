@@ -34,6 +34,22 @@ what landed lives in `docs/MILESTONES.md` (and git history once this is a repo).
 - [ ] Hard-negative mining for any learned cost term.
 - [ ] Attention over track history (sequence, not frame pairs).
 
+### Optimization (blocks any meaningful segmentation re-tune)
+- [ ] **Make `score_segmentation` measure what we want before re-tuning.** Two independent defects,
+      both measured in `docs/OPTIMIZATION.md` → *The objective is gameable*:
+      (a) purity is computed on background-inclusive intensities, so it is floored at
+      `1/n_channels` and uses only **34%** of its range (median 0.385); subtracting each channel's
+      25th percentile first gives median **0.709** and **90%** of the range, which would also make
+      the documented `purity_threshold=0.7` default usable again.
+      (b) the score is `n_good / n_large`, a ratio over a subset, so the search maximises it by
+      pushing large cells into the near-free fragment bin — a re-tune raised the score from 0.429
+      to 0.523 while the absolute count of good cells *fell* from 140 to 116, and
+      `affinity_threshold` pinned to every upper bound it was given.
+      Both are numeric-behaviour changes to the objective (they redefine "good"), so decide the
+      intent first. Then re-tune and update the notebook's `BEST_PARAMS`.
+- [ ] Consider whether fragmentation should be the primary target: **1951 of 2277** detections on a
+      real TEST movie are below `min_cell_size=100`.
+
 ### Segmentation
 - [ ] Reduce Y-cell splitting without over-merging (current mitigation: merge threshold > 0.90).
 - [ ] **`compute_cumulative_displacement` re-runs Farneback that `compute_multi_scale_optical_flow`

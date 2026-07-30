@@ -18,6 +18,10 @@ PARAM_NAMES = [
 
 PARAM_BOUNDS = {
     # 'prob_threshold':                      (0.2, 0.5),
+    # Left at 0.6 deliberately. A tune with a working (non-flat) objective pins this at
+    # whatever the upper bound is — 0.6, then 0.8 when widened — because the objective
+    # rewards under-segmentation, not because higher is better. Widen it only after
+    # score_segmentation stops being gameable; see docs/OPTIMIZATION.md.
     'affinity_threshold':                  (0.2, 0.6),
     'merge_affinity_threshold':            (0.2, 0.6),
     # Floored at 1.0: distance_transform_edt(~mask) is 0 on a fragment and >=1 off it, so any

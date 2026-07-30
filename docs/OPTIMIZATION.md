@@ -41,6 +41,43 @@ they had merging switched off and a `merge_affinity_threshold` (0.2261) below `a
 (0.5534) — a combination the `LearnedAffinityInference` docstring calls unusual. They are a starting
 point, not a result.
 
+### The objective is gameable — fix it before re-tuning (2026-07-30)
+
+Making the objective non-flat is necessary but **not sufficient**. Re-tuned with a working threshold
+(`purity_threshold=0.4`, `count_penalty_weight=0.0012`, 5 TRAIN eval frames), CMA-ES converges but
+`affinity_threshold` pins to whatever the upper bound is — 0.6, then 0.8 when the bound was widened.
+Measured on a held-out TEST movie:
+
+| params | total | large | **n_good** | frag | `n_good/n_large` (the score) |
+|---|---|---|---|---|---|
+| shipped, aff 0.553 | 2277 | 326 | **140** | 1951 | 0.429 |
+| tuned, aff 0.600 | 1891 | 251 | **122** | 1640 | 0.486 |
+| tuned, aff 0.800 | 1714 | 222 | **116** | 1492 | 0.523 |
+
+The score climbs while the absolute number of good cells **falls**. Because the denominator is
+`n_large` only, stricter growing moves large cells into the fragment bin — which costs almost nothing
+at a sane `count_penalty_weight` — and the surviving fraction looks purer. The search is rewarded for
+finding *fewer* cells. So do not adopt tuned parameters from this objective, and do not widen
+`affinity_threshold`'s bound to chase the wall.
+
+Two fixes to make first, both measured:
+
+1. **Subtract background before computing purity.** The statistic is
+   `max(mean_ch / mean_ch.sum())` on raw intensities, so it is floored at `1/n_channels` and sits just
+   above it. On a real movie (326 large cells): median **0.385**, spanning **34%** of the usable
+   `[1/3, 1]` range. Subtracting each channel's 25th percentile first: median **0.709**, spanning
+   **90%**. Most large cells *are* strongly single-channel-dominant — the current metric hides it
+   behind background, which is also why any threshold ≥ 0.6 zeroes the objective out. Fix this and the
+   function's own default (0.7) becomes meaningful again, rather than needing to be lowered to 0.4.
+2. **Stop maximising a ratio over a subset.** Put fragments in the denominator (which is what
+   `optimize_segmentation_cma`'s docstring claimed the score was, before it was corrected to match the
+   code), or optimise `n_good` against a penalty on junk, so discarding a good cell always costs.
+   Under `n_good / n_total` the same three runs score 0.0615 / 0.0645 / 0.0677 — far less pathological,
+   though still not rewarding absolute recall.
+
+Note that fragmentation, not merging, is where the quality problem lives: **1951 of 2277** detections
+on that movie are below `min_cell_size=100`.
+
 ## Tracking tuning
 
 - `optimize_tracking_cma(...)` — searches `track_sequence` cost weights (`w_flow`, `w_color`,

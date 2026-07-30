@@ -30,7 +30,7 @@ Adopted cecelia's Claude documentation skeleton:
 ## 2026-07-08 — Notebooks cut over to the installable `cecelia` package
 - Dropped the `CECELIA_APP` / `sys.path` bootstrap in the notebooks; switched to
   `import cecelia.utils.*` against cecelia's new pip-installable package (built out on the
-  cecelia side per `cecelia-pineapple/docs/todo/PY_PACKAGING_PLAN.md`).
+  cecelia side per `cecelia-feijoa/docs/todo/PY_PACKAGING_PLAN.md`).
 - Repointed `BTRACK_CONFIG` at the vendored config via `cecelia.__file__` instead of an absolute
   path; added a `notebooks` extra (`btrack`); documented the `pip install -e <cecelia>/python`
   dev-link step in `docs/DATA.md`.
@@ -80,3 +80,50 @@ Set up `github.com/schienstockd/coastal` and the contribution standards:
 - Cruft + doc drift swept: unused imports, stale docstrings, χ² gate label + Mahalanobis (DeepSORT)
   citation, regenerated `SEGMENTATION.md` metric list, `TRACKING`/`ARCHITECTURE`/`OPTIMIZATION`/
   `MORPHOLOGY` drift.
+
+## 2026-07-30 — Streaming the 4D segmentation path (OOM fix + lazy flow metrics)
+- **The bug:** `notebooks/pipeline_consensus.ipynb` OOM-killed the kernel at
+  `predict_temporal_volume` on the real `[180, 4, 15, 531, 586]` movies. Four compounding causes —
+  two in the notebook, two in the package: `np.asarray(volumes[uid][0])` materialised the whole
+  6.7 GB movie even though the function streams per z-slice; the tracking cell materialised the same
+  movie a second time; `n_workers=8` ran eight in-flight z-slices, each holding 14 float32 metric
+  planes × T (3.1 GB); and `predict_temporal_volume` retained every prob map and regionprops list.
+- `Inference3D.predict_temporal_volume` now writes per-slice labels straight into the single
+  `[T,Z,H,W]` int32 buffer and Z-stitches it **in place**, dropping each slice's prob maps and
+  regionprops as it finishes (they were retained for all T×Z = 2700 frames, ~6.7 GB, and no caller
+  ever read them). New `keep_results=False` default returns `None` for the second tuple element;
+  pass `keep_results=True` for the old inspection behaviour. Docstring now states the memory
+  contract.
+- Notebook refactored around the streaming seam: lazy dask passed everywhere (`extract_cell_intensities`
+  / `score_tracking` already index per timepoint), `grey` for Farneback built one z-slice at a time,
+  `SEG_WORKERS`/`FLOW_WORKERS` split out as named knobs, and segmented labels cached to
+  `CACHE_DIR` as `.npy` + reloaded with `mmap_mode='r'` so a kernel restart resumes at tracking
+  instead of re-segmenting.
+- **Then removed the ceiling itself: flow metrics are now lazy.** `prepare_data_for_unet` returns a
+  `TemporalMetrics` sequence instead of a list of T dicts — same values, same indexing/slicing/
+  iteration, but each frame's 14 float32 planes are built when asked for. That term was 3.1 GB per
+  in-flight z-slice at T=180 while `predict_sequence` only ever reads one frame at a time. Kept to
+  **one** path rather than a streaming fork: the single lazy type is what everything gets, and the
+  two training entry points (`prepare_data_for_unet_batch_4d` / `_batch`) call `list(...)` because a
+  Dataset indexes per sample per epoch. Deleted `compute_all_temporal_metrics` — it had become a
+  second way to say `list(metrics)`, unused outside its own test.
+- `extract_temporal_metrics` no longer rebuilds and renormalises the **whole stack on every call**
+  just to read one frame out of it (O(T) full-stack copies per z-slice). It scales the one frame it
+  needs, with the global min/max cached by `TemporalMetrics` via a new `frame_range` arg. Measured
+  in isolation: **38.4 s → 0.07 s** per z-slice at T=180, 531×586 — ~10 min of pure waste per
+  15-slice movie. `normalize_and_project` likewise selects channels *before* the float32 cast
+  instead of converting all C and discarding some.
+- **Measured on the box** (not estimated): peak RSS for one in-flight z-slice at T=180 went
+  **~7.0 GB → ~4.0 GB** (incl. the Torch/CUDA context), which lifts the notebook's `SEG_WORKERS`
+  from 2 to 4 on 31 GB — roughly 2× throughput on a 15-slice movie — with ~6 as the ceiling. The
+  four rewritten notebook expressions were verified **exactly equal** to the numpy ones they replace
+  on real cecelia data (streamed `grey`, `extract_cell_intensities`, `score_tracking`, and tracking
+  on a read-only mmap).
+- Tests (31 total): `tests/test_segment.py` gains a 4D contract test with a stub UNet — shape/dtype,
+  Z-consistent labels, `keep_results` parity — and pins the streaming guarantee with a lazy
+  stand-in whose `__array__` raises, so re-introducing `np.asarray(volume)` fails the suite. New
+  `tests/test_flow_lazy_metrics.py` pins that the per-frame normalisation is **bit-identical** to the
+  old whole-stack copy, that the cached `frame_range` changes nothing, that the sequence really is
+  lazy and uncached, and that channel-selection order in `normalize_and_project` is neutral.
+- Follow-up parked in `docs/TODO.md`: `compute_cumulative_displacement` re-runs consecutive-frame
+  Farneback that the multi-scale pass already computed (~a third of the flow time).

@@ -11,7 +11,7 @@ what landed lives in `docs/MILESTONES.md` (and git history once this is a repo).
       (`scripts/link_cecelia.sh` / local path install) with a normal pinned dependency in
       `pyproject.toml` (`cecelia>=<x.y>`), and delete `scripts/link_cecelia.sh`. See
       `docs/DATA.md` → *Installing / keeping cecelia in sync*. Gated on the cecelia-side publish
-      (`cecelia-pineapple/docs/todo/PY_PACKAGING_PLAN.md`, Decision 1 dist-name check).
+      (`cecelia-feijoa/docs/todo/PY_PACKAGING_PLAN.md`, Decision 1 dist-name check).
 
 ### Repo structure / docs
 - [ ] Backfill `TRACKING_SESSION_SUMMARY.md` numbers into `docs/TRACKING.md`'s table when they
@@ -36,3 +36,11 @@ what landed lives in `docs/MILESTONES.md` (and git history once this is a repo).
 
 ### Segmentation
 - [ ] Reduce Y-cell splitting without over-merging (current mitigation: merge threshold > 0.90).
+- [ ] **`compute_cumulative_displacement` re-runs Farneback that `compute_multi_scale_optical_flow`
+      already computed.** For each center frame it calls `calc_flow_farneback_between_frames` over
+      its whole window, so at `cumulative_window=2` it does ~2T consecutive-frame flows while
+      scale 1 of the multi-scale pass has already computed all T−1 of them. Roughly a third of the
+      flow time on the 4D path is redundant. The fix is to sum the existing scale-1 flows instead
+      — but only valid when scale 1 is present and the window is consecutive-frame, so it needs a
+      guard rather than an unconditional swap (and must not become a second flow path). Verify
+      values are unchanged before/after with a golden test.

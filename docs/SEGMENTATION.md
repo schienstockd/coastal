@@ -75,6 +75,35 @@ the prob map, then merges fragments. `TwoPassSegmentationInference` runs it twic
 
 `Inference3D` applies this per Z-slice and stitches via `utils.match_masks_3d`.
 
+### Memory: the 4D path (`predict_temporal_volume`)
+
+`predict_temporal_volume(volume, ...)` is the entry point for a whole `[T,C,Z,Y,X]` movie, and on
+real confetti movies (`[180, 4, 15, 531, 586]` uint16 ≈ 6.7 GB) it is the one place in coastal where
+RAM is the binding constraint. Three rules:
+
+1. **Pass the volume lazily.** It reads `volume.shape` and then slices `volume[:, :, z, :, :]`, so a
+   dask array straight from cecelia streams one z-slice at a time. `np.asarray(volume)` at the call
+   site materialises the whole movie first and defeats this — the notebook regression that OOM-killed
+   the kernel. `tests/test_segment.py` pins the contract with a stand-in whose `__array__` raises.
+2. **`n_workers` is a memory multiplier, not just a speed knob.** One in-flight z-slice holds its
+   flow fields — multi-scale + cumulative, ~1.8 GB at T=180, 531×586 — for the slice's lifetime.
+   The 14 float32 metric planes per frame are built on demand (`flow.TemporalMetrics`), so only the
+   current frame's are resident; when they were all precomputed this term was 3.1 GB on its own.
+   Measured: **~4.0 GB peak RSS** for a single slice including the Torch/CUDA context, down from
+   ~7.0 GB. Cost is linear in `n_workers` — 4 slices plus the 3.4 GB label buffer ≈ 15 GB on a
+   31 GB box (~6 is the ceiling), where 8 under eager metrics wanted ~40 GB and OOM-killed the
+   kernel.
+3. **Per-slice results are dropped by default.** Only `instances` (copied into the single
+   `[T,Z,H,W]` int32 output buffer, then Z-stitched in place) and `num_cells` are kept; the prob maps
+   and regionprops of each frame are released as the slice finishes. Passing `keep_results=True`
+   retains them for inspection and costs a further ~2× the output buffer plus one regionprops list
+   per frame (T×Z of them) — it returns `None` otherwise.
+
+If RAM is still short, cut `T` (segment a temporal window) rather than raising `n_workers`. Note that
+per-chunk temporal windows change the normalisation statistics — `normalize_and_project` and
+`normalize_metric` take percentiles over the frames given — so labels from a chunked run are not
+bit-identical to a whole-movie run.
+
 ### Default best parameters
 
 ```python
@@ -144,8 +173,12 @@ The UNet's `in_channels` must match the metric count chosen (plus the frame chan
 data contract in `docs/ARCHITECTURE.md`).
 
 ### Cost & troubleshooting
-- Metrics are computed **once** and reused across all training epochs. Multi-scale is markedly
-  slower than frame-to-frame; drop scale 8 (`[1,2,4]`) if too slow.
+- Metrics are computed **once** and reused across all training epochs — `prepare_data_for_unet`
+  returns a lazy `TemporalMetrics` sequence, and the training entry points
+  (`prepare_data_for_unet_batch_4d` / `prepare_data_for_unet_batch`) materialise it with `list(...)`
+  so the Dataset is not recomputing planes every epoch. Single-pass consumers (segmentation
+  inference) iterate it lazily instead — that is what keeps the 4D path in RAM. Multi-scale is
+  markedly slower than frame-to-frame; drop scale 8 (`[1,2,4]`) if too slow.
 - All-zero metrics → check frame normalisation to [0,1]
   (`(f - f.min()) / (f.max() - f.min() + 1e-5)`).
 - Out of memory → fewer temporal scales.

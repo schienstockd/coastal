@@ -597,7 +597,10 @@ def prepare_data_for_unet_batch_4d(
             variance_metrics = compute_variance_metrics(frames_multi_uint8, variance_config)
 
             all_frames.append(frames_prep)
-            all_temporal.append(temporal_metrics)
+            # Materialise: prepare_data_for_unet hands back a lazy TemporalMetrics, but the
+            # training Dataset indexes metrics per sample per epoch, so they must be computed
+            # once here. Cheap at seq_len frames (vs. the full-T inference path).
+            all_temporal.append(list(temporal_metrics))
             all_variance.append(variance_metrics)
             all_frames_multi.append(frames_multi_uint8)
             if return_flows:
@@ -647,7 +650,7 @@ def prepare_data_for_unet_batch(movies, temporal_scales=[1, 2, 4, 8], cumulative
         )
 
         all_frames.append(frames_prep)
-        all_metrics.append(metrics)
+        all_metrics.append(list(metrics))   # materialise for training (see batch_4d above)
         print(f"  ✓ {len(frames_prep)} frames with {len(metrics[0])} metrics each\n")
 
     return all_frames, all_metrics

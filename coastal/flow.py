@@ -5,6 +5,8 @@ Multi-scale windowing with Farneback + advanced flow deformation metrics.
 Removes redundant metrics that don't vary (motion_at_corners, motion_at_edges, angle).
 """
 
+from collections.abc import Sequence
+
 import numpy as np
 import cv2
 from tqdm import tqdm
@@ -153,13 +155,33 @@ def _flow_deformation(u, v):
     return divergence, vorticity, strain
 
 
-def extract_temporal_metrics(frames, multi_scale_flows, cumulative_flows, frame_idx):
-    """Extract rich temporal motion metrics for ONE frame."""
-    
-    frames_array = np.array(frames, dtype=np.float32)
-    frames_array = (frames_array - frames_array.min()) / (frames_array.max() - frames_array.min() + 1e-5)
-    frame = frames_array[frame_idx]
-    
+def extract_temporal_metrics(frames, multi_scale_flows, cumulative_flows, frame_idx,
+                             frame_range=None):
+    """Extract rich temporal motion metrics for ONE frame.
+
+    Args:
+        frames:            [T, H, W] stack (only frame_idx is normalised and used)
+        multi_scale_flows: {scale: [flow dicts]} from compute_multi_scale_optical_flow
+        cumulative_flows:  [cum dicts] from compute_cumulative_displacement
+        frame_idx:         which frame to compute metrics for
+        frame_range:       optional (min, max) over the whole `frames` stack. The
+                           normalisation is global by design, so this must be the true
+                           stack min/max — pass it to skip re-scanning the stack on
+                           every frame (`TemporalMetrics` caches it once).
+
+    Returns:
+        dict of 14 [H, W] float32 metric planes.
+    """
+    # Normalise only the frame we need. Scaling stays global (the stack's min/max), but
+    # materialising the whole stack as float32 here cost a full copy per frame — i.e.
+    # O(T) copies for O(T) frames on the 4D inference path.
+    frames_array = np.asarray(frames)
+    if frame_range is None:
+        lo, hi = frames_array.min(), frames_array.max()
+    else:
+        lo, hi = frame_range
+    frame = (frames_array[frame_idx].astype(np.float32) - lo) / (hi - lo + 1e-5)
+
     metrics = {}
     
     # ==== MULTI-SCALE FLOW MAGNITUDES ====
@@ -261,23 +283,47 @@ def extract_temporal_metrics(frames, multi_scale_flows, cumulative_flows, frame_
     return metrics
 
 
-def compute_all_temporal_metrics(frames, multi_scale_flows, cumulative_flows, verbose=True):
-    """Extract temporal metrics for all frames."""
-    N = len(frames)
-    metrics_all = []
+class TemporalMetrics(Sequence):
+    """The T per-frame metric dicts, computed on demand.
 
-    if verbose:
-        print(f"\n{'='*70}")
-        print(f"EXTRACTING TEMPORAL METRICS FOR ALL {N} FRAMES")
-        print(f"{'='*70}")
+    A drop-in for the eager `list` it replaces — `len()`, `m[t]`, slicing and iteration
+    all behave identically, and `m[t]` is exactly `extract_temporal_metrics(..., t)`. The
+    only difference is *when* the work happens.
 
-    for idx in tqdm(range(N), desc='Frame metrics', disable=not verbose):
-        m = extract_temporal_metrics(frames, multi_scale_flows, cumulative_flows, idx)
-        metrics_all.append(m)
+    This exists because the 14 float32 metric planes per frame dominate memory on the 4D
+    inference path (14 × T × H × W × 4 B = 3.1 GB at T=180, 531×586) while
+    `predict_sequence` only ever looks at one frame at a time. The flow fields stay
+    precomputed and shared — frame t reads neighbouring scales, so they cannot be
+    streamed — and they are ~1.8 GB rather than 3.1 GB.
 
-    if verbose:
-        print(f"✓ Extracted metrics for {len(metrics_all)} frames")
-    return metrics_all
+    **Materialise for training.** Metrics are meant to be computed once and reused across
+    epochs, and a Dataset indexes them per sample per epoch, so training paths call
+    `list(...)` (`prepare_data_for_unet_batch_4d` does this for you). Single-pass
+    consumers — segmentation inference — should iterate lazily and leave it alone.
+    """
+
+    def __init__(self, frames, multi_scale_flows, cumulative_flows):
+        self._frames = np.asarray(frames)
+        self._multi_scale_flows = multi_scale_flows
+        self._cumulative_flows = cumulative_flows
+        # Global scaling, scanned once instead of once per frame.
+        self._frame_range = (self._frames.min(), self._frames.max())
+
+    def __len__(self):
+        return len(self._frames)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(len(self)))]
+        idx = int(idx)
+        if idx < 0:
+            idx += len(self)
+        if not 0 <= idx < len(self):
+            raise IndexError(f"frame index out of range: {idx}")
+        return extract_temporal_metrics(
+            self._frames, self._multi_scale_flows, self._cumulative_flows, idx,
+            frame_range=self._frame_range,
+        )
 
 
 from dataclasses import dataclass
@@ -394,12 +440,15 @@ def normalize_and_project(frames_seq, ch_indices=None, percentile_lo=0.01, perce
         frames_multi:   [T, C', H, W] uint8, per-channel normalized to [0, 255]
         frames_proj:    [T, H, W] uint8, mean projection across channels
     """
-    arr = np.asarray(frames_seq, dtype=np.float32)
+    # Select channels *before* the float32 conversion: converting all C first and then
+    # discarding channels cost a full-movie float32 copy per z-slice. One copy, and it is
+    # already private, so the per-channel scaling below can run in place.
+    arr = np.asarray(frames_seq)
     if ch_indices is not None:
         arr = arr[:, list(ch_indices)]
+    frames_norm = arr.astype(np.float32)
 
-    T, C, H, W = arr.shape
-    frames_norm = arr.copy()
+    T, C, H, W = frames_norm.shape
 
     for c in range(C):
         ch = frames_norm[:, c]
@@ -428,6 +477,15 @@ def prepare_data_for_unet(frames, temporal_scales=[1, 2, 4, 8], cumulative_windo
     Complete pipeline: frames → temporal metrics → UNet-ready data
     Uses Farneback optical flow with advanced flow deformation metrics.
     Streamlined to remove redundant metrics.
+
+    Returns:
+        frames_normalized:  [T, H, W] float32 in [0, 1]
+        multi_scale_flows:  {scale: [flow dicts]}
+        cumulative_flows:   [cum dicts]
+        metrics:            `TemporalMetrics` — a lazy Sequence of T metric dicts. Indexes
+                            and iterates exactly like the list it replaces; call `list(...)`
+                            to materialise (training does, inference must not — see the
+                            class docstring and docs/SEGMENTATION.md).
     """
 
     if verbose:
@@ -453,10 +511,8 @@ def prepare_data_for_unet(frames, temporal_scales=[1, 2, 4, 8], cumulative_windo
     frames_normalized = frames_array.astype(np.float32)
     frames_normalized = (frames_normalized - frames_normalized.min()) / (frames_normalized.max() - frames_normalized.min() + 1e-5)
 
-    # Extract metrics
-    metrics = compute_all_temporal_metrics(
-        frames_normalized, multi_scale_flows, cum_flows, verbose=verbose
-    )
+    # Metrics stay lazy: one frame's 14 planes at a time instead of all T up front.
+    metrics = TemporalMetrics(frames_normalized, multi_scale_flows, cum_flows)
 
     if verbose:
         print(f"\n{'='*80}")

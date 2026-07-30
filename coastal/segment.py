@@ -885,6 +885,7 @@ class Inference3D:
         temporal_scales=[1, 2, 4],
         cumulative_window=2,
         n_workers=4,
+        keep_results=False,
     ):
         """Segment a 4D volume [T, C, Z, Y, X] over time.
 
@@ -892,18 +893,38 @@ class Inference3D:
         For each timepoint: stitches Z labels with IOU matching so cells have
         consistent IDs across Z-planes.
 
+        Memory: `volume` should be passed **lazily** (a dask array straight from
+        cecelia) — only one z-slice is materialised at a time, so `np.asarray(volume)`
+        at the call site defeats the streaming and costs T×C×Z×H×W×2 bytes. The two
+        terms that do scale are:
+
+          * per worker  — the z-slice's flow fields (multi-scale + cumulative, ~1.8 GB
+            at T=180, 531×586) held for the lifetime of that slice. The 14 metric planes
+            per frame are computed on demand by `flow.TemporalMetrics`, so only the
+            current frame's are resident. `n_workers` multiplies this, so it is still
+            the dominant cost (see docs/SEGMENTATION.md).
+          * the output  — the [T, Z, H, W] int32 label buffer, written in place.
+
+        Per-slice labels are copied into that buffer and the rest of each
+        `predict_sequence` result (prob maps, regionprops) is dropped as soon as the
+        slice finishes; pass `keep_results=True` to retain them for inspection, which
+        costs a further ~2× the output buffer plus one regionprops list per frame.
+
         Args:
-            volume:            [T, C, Z, Y, X] array
+            volume:            [T, C, Z, Y, X] array; lazy (dask) is preferred
             ch_indices:        channel indices to use for projection/flow (None = all)
             stitch_threshold:  min IOU for label matching across Z (default 0.0)
             gap_tolerance:     bridge chains broken by up to this many bad slices (default 1)
             gap_iou_threshold: min IOU to accept a gap bridge (default 0.3)
             temporal_scales:   Farneback multi-scale parameters
             cumulative_window: cumulative displacement window
+            n_workers:         z-slices segmented concurrently (memory multiplier)
+            keep_results:      keep the full per-slice result dicts (default False)
 
         Returns:
             instances_4d: [T, Z, H, W] int32 matched instance labels
-            results_per_z: list of Z predict_sequence result lists (one per z-slice)
+            results_per_z: list of Z predict_sequence result lists (one per z-slice),
+                           or None when keep_results is False
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from coastal.flow import prepare_data_for_unet, normalize_and_project
@@ -913,10 +934,15 @@ class Inference3D:
         print(f"\n4D Temporal Segmentation: {T} timepoints × {Z} z-slices × {H}×{W} px")
         print(f"  Using {n_workers} parallel workers\n")
 
+        # Single buffer for the labels: filled per z-slice, then stitched in place.
+        instances_4d = np.zeros((T, Z, H, W), dtype=np.int32)
+        results_per_z = [None] * Z if keep_results else None
+
         def _process_z(z):
             print(f"  Z {z+1:2d}/{Z}: computing flow...", flush=True)
             seq = np.asarray(volume[:, :, z, :, :])  # load one z-slice
             _, frames_proj = normalize_and_project(seq, ch_indices)
+            del seq
 
             frames_prep, _, _, temporal_metrics = prepare_data_for_unet(
                 frames_proj,
@@ -929,33 +955,38 @@ class Inference3D:
             results_z = self.inferencer_2d.predict_sequence(
                 frames_prep, temporal_metrics, show_progress=False
             )
+
+            # Keep only what the stitching below needs; release the prob maps and
+            # regionprops of this slice before the next one is loaded.
+            for t, r in enumerate(results_z):
+                instances_4d[t, z] = r['instances']
             avg_cells = np.mean([r['num_cells'] for r in results_z])
             print(f"  Z {z+1:2d}/{Z}: done — {avg_cells:.0f} cells/frame avg", flush=True)
-            return z, results_z
+            return z, (results_z if keep_results else None)
 
-        results_per_z = [None] * Z
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             futures = {ex.submit(_process_z, z): z for z in range(Z)}
             for future in as_completed(futures):
                 z, results_z = future.result()
-                results_per_z[z] = results_z
+                if keep_results:
+                    results_per_z[z] = results_z
 
         print(f"\n  Stitching Z labels at each of {T} timepoints...")
-        instances_4d = np.zeros((T, Z, H, W), dtype=np.int32)
 
+        # match_masks_3d copies its input, so writing the result back into the same
+        # timepoint is safe; timepoints are independent, hence the thread pool.
         def _stitch_t(t):
-            masks_at_t = [results_per_z[z][t]['instances'] for z in range(Z)]
-            return t, match_masks_3d(
-                masks_at_t,
+            instances_4d[t] = match_masks_3d(
+                instances_4d[t],
                 stitch_threshold=stitch_threshold,
                 gap_tolerance=gap_tolerance,
                 gap_iou_threshold=gap_iou_threshold,
             )
+            return t
 
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            for t, masks_matched in ex.map(_stitch_t, range(T)):
-                for z, inst in enumerate(masks_matched):
-                    instances_4d[t, z] = inst
+            for _t in ex.map(_stitch_t, range(T)):
+                pass
 
         n_cells_per_t = [int(len(np.unique(instances_4d[t])) - 1) for t in range(T)]
         print(f"  Done. Cells/timepoint: min={min(n_cells_per_t)}, "

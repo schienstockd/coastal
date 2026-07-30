@@ -81,7 +81,7 @@ Set up `github.com/schienstockd/coastal` and the contribution standards:
   citation, regenerated `SEGMENTATION.md` metric list, `TRACKING`/`ARCHITECTURE`/`OPTIMIZATION`/
   `MORPHOLOGY` drift.
 
-## 2026-07-30 — Streaming the 4D segmentation path (OOM fix + lazy flow metrics)
+## 2026-07-30 — Streaming the 4D segmentation path (OOM fix, lazy flow metrics, 8.5× faster frames)
 - **The bug:** `notebooks/pipeline_consensus.ipynb` OOM-killed the kernel at
   `predict_temporal_volume` on the real `[180, 4, 15, 531, 586]` movies. Four compounding causes —
   two in the notebook, two in the package: `np.asarray(volumes[uid][0])` materialised the whole
@@ -113,15 +113,35 @@ Set up `github.com/schienstockd/coastal` and the contribution standards:
   in isolation: **38.4 s → 0.07 s** per z-slice at T=180, 531×586 — ~10 min of pure waste per
   15-slice movie. `normalize_and_project` likewise selects channels *before* the float32 cast
   instead of converting all C and discarding some.
+- **Then the CPU side: per-label loops no longer touch the whole frame.** Profiling `predict_frame`
+  on a real 531×586 frame (~600 labels) put ~90% of its 6.6 s in four `for label in ...` loops doing
+  whole-frame work: `binary_fill_holes` per label (45%), `distance_transform_edt` per fragment (30%),
+  `instances == label` size/reindex passes (9%), and `components == comp_id` per component in the
+  seed-guarantee step. All four now work inside per-label bounding boxes (`find_objects`) or, for
+  `_remove_small_components`, a single `bincount` + lookup-table gather; the embedding blur became one
+  `gaussian_filter(sigma=(s, s, 0))` call instead of 64 per-channel calls. **6.62 → 0.78 s/frame
+  (8.5×)** with **bit-identical labels**, verified by replaying the pre-optimisation `segment.py`
+  straight out of git against the new one over real frames. One z-slice at T=180: **≳20 min → 142 s**.
+- **Found while profiling:** `merge_max_distance < 1.0` disables fragment merging outright —
+  `distance_transform_edt(~mask)` is 0 on the fragment and ≥1 off it, so a sub-1 threshold selects
+  only the fragment's own pixels, which `& ~mask` removes. The notebook's CMA-ES-tuned `BEST_PARAMS`
+  use 0.6198, so merging (and with it the documented Y-cell-splitting mitigation) has been inert,
+  while still paying for ~600 whole-frame distance transforms per frame. Recorded in
+  `docs/SEGMENTATION.md` and pinned by a test; the tuning call itself is Dominik's.
 - **Measured on the box** (not estimated): peak RSS for one in-flight z-slice at T=180 went
-  **~7.0 GB → ~4.0 GB** (incl. the Torch/CUDA context), which lifts the notebook's `SEG_WORKERS`
-  from 2 to 4 on 31 GB — roughly 2× throughput on a 15-slice movie — with ~6 as the ceiling. The
+  **~7.0 GB → 4.65 GB** (incl. the Torch/CUDA context), which lifts the notebook's `SEG_WORKERS`
+  from 2 to 4 on 31 GB — with ~6 as the ceiling. Together with the loop work a 15-slice movie goes
+  from hours to **~10 min**. The
   four rewritten notebook expressions were verified **exactly equal** to the numpy ones they replace
   on real cecelia data (streamed `grey`, `extract_cell_intensities`, `score_tracking`, and tracking
   on a read-only mmap).
-- Tests (31 total): `tests/test_segment.py` gains a 4D contract test with a stub UNet — shape/dtype,
+- Tests (80 total): `tests/test_segment_localised.py` keeps every pre-optimisation implementation
+  **verbatim as the oracle** and compares against the rewrites over randomised label maps (holes,
+  touching pairs, frame-edge cases, `merge_max_distance` 0.62–3.0), plus bit-identity of the
+  argmax tie-break and the single-call embedding blur. `tests/test_segment.py` gains a 4D contract
+  test with a stub UNet — shape/dtype,
   Z-consistent labels, `keep_results` parity — and pins the streaming guarantee with a lazy
-  stand-in whose `__array__` raises, so re-introducing `np.asarray(volume)` fails the suite. New
+  stand-in whose `__array__` raises, so re-introducing `np.asarray(volume)` fails the suite.
   `tests/test_flow_lazy_metrics.py` pins that the per-frame normalisation is **bit-identical** to the
   old whole-stack copy, that the cached `frame_range` changes nothing, that the sequence really is
   lazy and uncached, and that channel-selection order in `normalize_and_project` is neutral.

@@ -10,7 +10,8 @@ See TUNING_GUIDE.md for decision-tree parameter tuning.
 import numpy as np
 import torch
 from scipy import ndimage
-from scipy.ndimage import binary_dilation, gaussian_filter, maximum_filter, distance_transform_edt
+from scipy.ndimage import (binary_dilation, gaussian_filter, maximum_filter,
+                           distance_transform_edt, find_objects)
 from skimage.measure import regionprops
 
 from coastal.device import resolve_device
@@ -251,14 +252,16 @@ class LearnedAffinityInference:
         seeds_binary = local_max & binary
 
         # Every connected component above prob_threshold must have at least one seed.
+        # Scoped to each component's bounding box: the brightest pixel of a component is
+        # inside its own box, and row-major order within the box preserves the whole-frame
+        # argmax tie-break, so the seed chosen is the same one.
         components, n_components = ndimage.label(binary)
-        for comp_id in range(1, n_components + 1):
-            comp_mask = components == comp_id
-            if not seeds_binary[comp_mask].any():
-                peak = np.unravel_index(
-                    np.where(comp_mask, prob_map, -1).argmax(), prob_map.shape
-                )
-                seeds_binary[peak] = True
+        for comp_id, sl in enumerate(find_objects(components), start=1):
+            comp_mask = components[sl] == comp_id
+            if not seeds_binary[sl][comp_mask].any():
+                scored = np.where(comp_mask, prob_map[sl], -1.0)
+                local = np.unravel_index(scored.argmax(), scored.shape)
+                seeds_binary[local[0] + sl[0].start, local[1] + sl[1].start] = True
 
         seeds, n_seeds = ndimage.label(seeds_binary)
 
@@ -267,9 +270,11 @@ class LearnedAffinityInference:
 
         emb_norm = emb_np / (np.linalg.norm(emb_np, axis=2, keepdims=True) + 1e-5)
 
-        emb_smoothed = np.zeros_like(emb_norm)
-        for d in range(emb_norm.shape[2]):
-            emb_smoothed[:, :, d] = gaussian_filter(emb_norm[:, :, d], sigma=self.embedding_blur_sigma)
+        # One filter call over [H, W, D] with sigma=0 on the channel axis (an identity
+        # kernel) instead of D separate 2D calls — same separable passes per channel,
+        # without the per-channel Python/scipy overhead (D is 64 in practice).
+        emb_smoothed = gaussian_filter(
+            emb_norm, sigma=(self.embedding_blur_sigma, self.embedding_blur_sigma, 0))
 
         instances = self._grow_regions_fast(emb_smoothed, seeds, binary, prob_map)
 
@@ -340,18 +345,29 @@ class LearnedAffinityInference:
         return instances
 
     def _fill_holes(self, instances):
-        """Fill holes in instance labels (donut-shaped regions become solid)."""
-        from scipy.ndimage import binary_fill_holes
+        """Fill holes in instance labels (donut-shaped regions become solid).
+
+        Each label is processed inside its own bounding box (`find_objects`) with a 1-px
+        zero border, which reproduces the whole-frame result exactly: the label lies
+        entirely within its box, so a background component that escapes the box also
+        escapes to the frame edge, and neither gets filled. Labels are still applied in
+        ascending order, so a hole containing a lower-numbered label is overwritten just
+        as before. Whole-frame `binary_fill_holes` per label was ~45% of segmentation
+        time at ~600 labels/frame.
+        """
+        from scipy.ndimage import binary_fill_holes, find_objects
 
         instances_filled = instances.copy()
 
-        for inst_id in np.unique(instances):
-            if inst_id == 0:
+        for inst_id, sl in enumerate(find_objects(instances), start=1):
+            if sl is None:                      # label id absent from this frame
                 continue
 
-            mask = (instances == inst_id).astype(np.uint8)
-            mask_filled = binary_fill_holes(mask).astype(np.uint8)
-            instances_filled[mask_filled == 1] = inst_id
+            sub = instances[sl] == inst_id
+            padded = np.zeros((sub.shape[0] + 2, sub.shape[1] + 2), dtype=bool)
+            padded[1:-1, 1:-1] = sub
+            filled = binary_fill_holes(padded)[1:-1, 1:-1]
+            instances_filled[sl][filled] = inst_id   # basic slice -> writes through
 
         return instances_filled
 
@@ -365,28 +381,48 @@ class LearnedAffinityInference:
         3. Embeddings are similar (affinity > merge_affinity_threshold)
 
         Both brightness AND affinity must pass.
+
+        Per-fragment work happens inside a padded bounding box instead of on the whole
+        frame (whole-frame EDTs per fragment were ~30% of segmentation time at ~600
+        fragments/frame). Every predicate below thresholds a distance at
+        <= max(1.0, merge_max_distance), so the box only has to be wide enough that those
+        distances match their whole-frame values: a pixel within merge_max_distance of
+        *both* fragments puts the other fragment's nearest pixel within 2x that of this
+        one, so `pad` covers it. Beyond the box the true distance exceeds the threshold,
+        and a cropped transform can only over-estimate, so the predicates stay False
+        either way.
         """
         unique_ids = np.unique(instances)
         unique_ids = unique_ids[unique_ids > 0]
 
+        pad = int(np.ceil(max(1.0, 2.0 * self.merge_max_distance))) + 1
+        boxes = find_objects(instances)
         merges = {}  # id_remove → id_keep
 
         for inst_id in unique_ids:
-            mask = instances == inst_id
+            sl = boxes[inst_id - 1]
+            if sl is None:
+                continue
+            box = tuple(slice(max(0, s.start - pad), min(dim, s.stop + pad))
+                        for s, dim in zip(sl, instances.shape))
+
+            inst_box = instances[box]
+            prob_box = prob_map[box]
+            mask = inst_box == inst_id
             dist1 = distance_transform_edt(~mask)
 
             # Candidates: pixels of other fragments within merge_max_distance
-            candidate_pixels = (dist1 <= self.merge_max_distance) & ~mask & (instances > 0)
-            neighbors = np.unique(instances[candidate_pixels])
+            candidate_pixels = (dist1 <= self.merge_max_distance) & ~mask & (inst_box > 0)
+            neighbors = np.unique(inst_box[candidate_pixels])
 
             for neighbor_id in neighbors:
                 if neighbor_id in merges:
                     continue
 
                 contact_prob, _, _ = self._compute_boundary_intensity(
-                    instances, prob_map, inst_id, neighbor_id, dist1
+                    inst_box, prob_box, inst_id, neighbor_id, dist1
                 )
-                n_contact = self._count_contact_pixels(instances, inst_id, neighbor_id, dist1)
+                n_contact = self._count_contact_pixels(inst_box, inst_id, neighbor_id, dist1)
 
                 # Minimum contact requirement
                 if n_contact < self.min_boundary_pixels:
@@ -419,7 +455,12 @@ class LearnedAffinityInference:
         return instances_merged
 
     def _compute_fragment_affinity(self, instances, embeddings, id1, id2):
-        """Compute cosine similarity between mean embeddings of two fragments."""
+        """Compute cosine similarity between mean embeddings of two fragments.
+
+        Takes the **whole-frame** instances/embeddings on purpose: the means are over every
+        pixel of each fragment, so unlike the distance predicates in
+        `_merge_split_instances` this one cannot be evaluated on a bounding-box crop.
+        """
         mask1 = (instances == id1)
         mask2 = (instances == id2)
 
@@ -481,20 +522,22 @@ class LearnedAffinityInference:
         return int(contact_mask.sum())
 
     def _remove_small_components(self, instances):
-        """Remove instances smaller than min_component_size and reindex."""
-        unique_labels = np.unique(instances)
-        for label_id in unique_labels:
-            if label_id == 0:
-                continue
-            if (instances == label_id).sum() < self.min_component_size:
-                instances[instances == label_id] = 0
+        """Remove instances smaller than min_component_size and reindex.
 
-        unique_labels = np.unique(instances)
-        instances_reindexed = np.zeros_like(instances)
-        for new_id, old_id in enumerate(unique_labels[1:], 1):
-            instances_reindexed[instances == old_id] = new_id
+        Sizes come from one `bincount` and the relabel is a single lookup-table gather,
+        replacing two full-frame comparisons per label (~600 of them per frame). Surviving
+        labels are still renumbered 1..n in ascending order of their old id, so the output
+        is identical to the per-label loop.
+        """
+        counts = np.bincount(instances.ravel())
+        keep = counts >= self.min_component_size
+        keep[0] = False                                    # background is not a label
 
-        return instances_reindexed
+        lut = np.zeros(counts.size, dtype=instances.dtype)
+        surviving = np.flatnonzero(keep)                   # ascending old ids
+        lut[surviving] = np.arange(1, surviving.size + 1, dtype=instances.dtype)
+
+        return lut[instances]
 
     def predict_volume_3d(self, volume_3d, metrics_3d):
         """

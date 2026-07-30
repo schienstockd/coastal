@@ -46,9 +46,24 @@ def _vec_to_params(x):
 
 def score_label_size_confetti(results, frames_multi, max_cell_size=300,
                               purity_threshold=0.8, background_percentile=25,
-                              min_coloured_pixels=5, verbose=False):
+                              min_coloured_pixels=5, flows=None,
+                              coherence_threshold=0.5, verbose=False):
     """
     "The largest reasonable label size while preserving confetti" (Dominik's formulation).
+
+    Uses both signals, in their respective roles — **confetti is identity, flow is
+    separation**:
+
+      * confetti (identity)  — a label holding two colours holds two cells. Catches merges
+        *across* colours, and nothing else: with ~270 cells per channel two merged cells
+        share a colour about a third of the time, and then identity cannot see it.
+      * flow (separation)    — a label spanning a motion discontinuity spans a boundary,
+        whatever the colours are. This is what catches the same-colour merges identity is
+        blind to, and it is the original premise of the package: cells are separated by
+        their differential motion, not by their appearance.
+
+    Pass `flows` to enable the separation constraint. A label then counts only if it is
+    both colour-pure *and* motion-coherent.
 
     Confetti constrains segmentation from one side only: a label spanning two colours is a
     merge error, but a fragment of a single colour looks perfectly pure. So purity alone
@@ -98,6 +113,15 @@ def score_label_size_confetti(results, frames_multi, max_cell_size=300,
         min_coloured_pixels:  labels with fewer bright/coloured pixels than this cannot be
                               judged, and are treated as impure (they still count in the
                               denominator, so they are not free)
+        flows:                optional list of T [H, W, 2] dense (u, v) fields — e.g.
+                              `flow.extract_dense_flow_pairs(multi_scale_flows, scale=1)` or
+                              the `dense_flows` from `abm.compute_cell_flow_features`. When
+                              given, a label must also be motion-coherent to count.
+        coherence_threshold:  minimum vector coherence |Σv| / Σ|v| over a label's pixels
+                              (default 0.5). 1.0 = every pixel moves the same way; near 0 =
+                              the label straddles opposing motions, i.e. a boundary runs
+                              through it. Pixels that barely move are ignored, since their
+                              direction is noise.
         verbose:              print per-frame diagnostics
 
     Returns:
@@ -129,7 +153,7 @@ def score_label_size_confetti(results, frames_multi, max_cell_size=300,
         total_coloured = int((colour >= 0).sum())
 
         numerator = 0.0
-        n_pure = n_impure = 0
+        n_pure = n_impure = n_incoherent = 0
         pure_sizes = []
 
         for label, sl in enumerate(ndimage.find_objects(instances), start=1):
@@ -148,6 +172,19 @@ def score_label_size_confetti(results, frames_multi, max_cell_size=300,
                 n_impure += 1
                 continue
 
+            # Separation: does a motion boundary run through this label? Identity cannot
+            # answer that when both cells happen to share a colour.
+            if flows is not None and t < len(flows) and flows[t] is not None:
+                uv = np.asarray(flows[t], dtype=np.float32)[sl][mask]      # [N, 2]
+                mag = np.linalg.norm(uv, axis=1)
+                moving = mag > max(1e-3, 0.25 * np.median(mag) if len(mag) else 0.0)
+                if moving.sum() >= min_coloured_pixels:
+                    resultant = np.linalg.norm(uv[moving].sum(axis=0))
+                    coherence = resultant / (mag[moving].sum() + 1e-6)
+                    if coherence < coherence_threshold:
+                        n_incoherent += 1
+                        continue
+
             n_pure += 1
             pure_sizes.append(size)
             numerator += min(size, max_cell_size) ** 2
@@ -159,8 +196,10 @@ def score_label_size_confetti(results, frames_multi, max_cell_size=300,
 
         if verbose:
             med = float(np.median(pure_sizes)) if pure_sizes else 0.0
-            print(f"  Frame {t}: {n_pure} pure / {n_pure + n_impure} labels | "
-                  f"median pure size {med:.0f}px (cap {max_cell_size}) | "
+            print(f"  Frame {t}: {n_pure} counted / "
+                  f"{n_pure + n_impure + n_incoherent} labels "
+                  f"({n_impure} mixed-colour, {n_incoherent} mixed-motion) | "
+                  f"median size {med:.0f}px (cap {max_cell_size}) | "
                   f"coloured area {total_coloured}px | score={score:.4f}")
 
     return float(np.mean(frame_scores)) if frame_scores else 0.0

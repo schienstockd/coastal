@@ -230,3 +230,62 @@ def test_impure_labels_still_count_in_the_denominator():
     plus_impure = _size_score(TWO_CELLS[:1] + [(40, 5, 20, 50, 9)], frames=_sized_frames(
         regions=((5, 5, 20, 20, 0), (40, 5, 20, 25, 1), (40, 30, 20, 25, 2))))
     assert plus_impure < pure_only
+
+
+# --------------------------------------------------------------------------- #
+# Flow = separation: the merges identity cannot see                            #
+# --------------------------------------------------------------------------- #
+
+def _flow(regions):
+    """[1, H, W, 2] dense flow; regions is (y, x, h, w, u, v)."""
+    f = np.zeros((1, H, W, 2), dtype=np.float32)
+    for y, x, h, w, u, v in regions:
+        f[0, y:y + h, x:x + w, 0] = u
+        f[0, y:y + h, x:x + w, 1] = v
+    return f
+
+
+def test_flow_catches_a_same_colour_merge_that_confetti_cannot():
+    """Two touching cells of the SAME colour moving apart.
+
+    With ~270 cells per confetti channel this is common, and colour purity is blind to it:
+    the merged label is perfectly single-coloured. Flow separates them because a motion
+    boundary runs through the label.
+    """
+    # one 20x40 patch of a single colour = two adjacent same-colour cells
+    frames = _sized_frames(regions=((5, 5, 20, 40, 0),))
+    # left half moves left, right half moves right
+    flows = _flow(((5, 5, 20, 20, -3.0, 0.0), (5, 25, 20, 20, 3.0, 0.0)))
+
+    merged = [(5, 5, 20, 40, 1)]                      # one label over both
+    split = [(5, 5, 20, 20, 1), (5, 25, 20, 20, 2)]   # correctly separated
+
+    # Confetti alone cannot tell these apart — the merged label is colour-pure.
+    assert _size_score(merged, frames=frames) > 0
+    conf_only_merged = _size_score(merged, frames=frames)
+    conf_only_split = _size_score(split, frames=frames)
+
+    # With flow, the merged label is rejected as spanning a motion boundary...
+    with_flow_merged = _size_score(merged, frames=frames, flows=flows)
+    with_flow_split = _size_score(split, frames=frames, flows=flows)
+
+    assert with_flow_merged < conf_only_merged, 'flow must penalise the same-colour merge'
+    assert with_flow_split > with_flow_merged, 'the correct split must win once flow is used'
+    # and the correct split is unaffected by adding the flow constraint
+    assert with_flow_split == pytest.approx(conf_only_split)
+
+
+def test_coherent_motion_does_not_penalise_a_real_cell():
+    """A cell whose pixels move together must still count."""
+    frames = _sized_frames(regions=((5, 5, 20, 20, 0),))
+    flows = _flow(((5, 5, 20, 20, 2.0, 1.0),))
+    one = [(5, 5, 20, 20, 1)]
+    assert _size_score(one, frames=frames, flows=flows) == pytest.approx(
+        _size_score(one, frames=frames))
+
+
+def test_flow_constraint_is_opt_in():
+    """flows=None leaves behaviour exactly as before."""
+    frames = _sized_frames()
+    assert _size_score(TWO_CELLS, frames=frames, flows=None) == _size_score(
+        TWO_CELLS, frames=frames)

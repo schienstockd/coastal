@@ -246,9 +246,17 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     input_channels = 1 + n_temporal + n_variance
 
     print(f"\n{'='*80}")
-    n_losses = 3 + (1 if warp_weight > 0 else 0)
-    print(f"TRAINING: INTENSITY + TEMPORAL + VARIANCE{' + WARP' if warp_weight > 0 else ''} ({n_losses}-LOSS)")
-    print(f"Loss: Intensity ({intensity_weight}) + Temporal ({temporal_weight}) + Variance ({variance_weight}, window={variance_window_size}px, dropout_p={variance_dropout_p}) + Warp ({warp_weight})")
+    # Report exactly which losses are active, so a log line cannot misrepresent what was
+    # optimised (the header used to omit the confetti term entirely).
+    active = [n for n, w in (('INTENSITY', intensity_weight), ('TEMPORAL', temporal_weight),
+                             ('VARIANCE', variance_weight), ('WARP', warp_weight),
+                             ('CONFETTI', confetti_weight)) if w > 0]
+    n_losses = len(active)
+    print(f"TRAINING: {' + '.join(active)} ({n_losses}-LOSS)")
+    print(f"Loss: Intensity ({intensity_weight}) + Temporal ({temporal_weight}) + "
+          f"Variance ({variance_weight}, window={variance_window_size}px, "
+          f"dropout_p={variance_dropout_p}) + Warp ({warp_weight}) + "
+          f"Confetti ({confetti_weight}, blur={confetti_blur_sigma}px)")
     print(f"Gradient clipping: {max_grad_norm} | AMP: {use_amp} | Workers: {num_workers}")
     print(f"{'='*80}\n")
 

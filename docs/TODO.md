@@ -57,6 +57,16 @@ what landed lives in `docs/MILESTONES.md` (and git history once this is a repo).
       the data, are choosing those values.
 
 ### Segmentation quality (the actual bottleneck)
+- [ ] **Fix `ConfettiForegroundLoss` target scaling, then re-measure.** First attempt collapsed
+      detection: 428 labels/frame -> 14 (confetti only) or 100 (confetti + half intensity), and the
+      size objective fell 0.0768 -> 0.0010 / 0.0355 on a held-out movie. The target is normalised by
+      its per-image **max** after blurring, so typical cells land below the 0.4 inference prob
+      threshold. Try a high percentile instead of max, and a smaller `blur_sigma`. Off by default
+      until measured. (The idea is still the right one: the prob head currently has no confetti and
+      no flow input at all — its target is `0.5*bright + 0.3*contrast + 0.2*edge`.)
+- [ ] **Give the prob head a separation signal.** "Confetti is identity, flow is separation" — the
+      foreground target has neither today, and the objective now has both. A flow-discontinuity term
+      in the prob/boundary target is the missing piece.
 - [ ] **~86% of detections are fragments** (1951 of 2277 below `min_cell_size=100` on a real TEST
       movie), and inference parameters cannot fix it — they only shuffle the fragment population
       (1640–2280 across a full tuning sweep) while `n_good` stays flat. This is a training / model

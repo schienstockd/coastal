@@ -31,6 +31,26 @@ class ConfettiForegroundLoss(nn.Module):
     Note this guards **under**-segmentation only. A fragment of a single colour looks
     perfectly good to this signal, so it cannot penalise over-segmentation on its own —
     the blur is what supplies a size prior.
+
+    **Measured result of the first attempt: this made segmentation worse.** Trained on the
+    real movies (80 epochs, 7 TRAIN movies) and scored on a held-out movie with
+    `optimize.score_label_size_confetti`:
+
+        baseline (IntensityLoss)          428 labels/frame   score 0.0768
+        confetti_weight=1, intensity=0     14 labels/frame   score 0.0010
+        confetti_weight=1, intensity=0.5  100 labels/frame   score 0.0355
+
+    It collapses detection. The likely cause is target scaling in `forward`, not the idea:
+    the blurred colour-confidence map is normalised by its per-image **max**, so only the
+    brightest cell approaches 1.0 while typical cells land well below the 0.4 prob
+    threshold used at inference — so the model learns a very sparse foreground. Normalising
+    by a high percentile instead of the max (and/or reducing `blur_sigma`) is the obvious
+    next thing to try. Until that is measured, treat this loss as unvalidated; it is off by
+    default (`confetti_weight=0.0`).
+
+    Beware the metrics that made it look like a success: fragment-% and multi-colour-% both
+    improved dramatically (86%→90% frag but 38.7%→4.3% under-segmentation, purity 1.000)
+    because neither has a coverage term. Any objective without one rewards finding nothing.
     """
 
     def __init__(self, blur_sigma: float = 2.0):

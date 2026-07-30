@@ -188,3 +188,32 @@ Set up `github.com/schienstockd/coastal` and the contribution standards:
   lazy and uncached, and that channel-selection order in `normalize_and_project` is neutral.
 - Follow-up parked in `docs/TODO.md`: `compute_cumulative_displacement` re-runs consecutive-frame
   Farneback that the multi-scale pass already computed (~a third of the flow time).
+
+## 2026-07-30 — Confetti/flow as explicit signals (diagnosis good, first retrain failed)
+- **Found why inference tuning was worth ≤7%: the prob-head target is speckle.** `IntensityLoss`
+  builds it as `0.5*bright + 0.3*local_contrast + 0.2*edge` — half a per-pixel intensity threshold,
+  half two edge detectors that peak on boundaries and noise — with no cell-scale structure and **no
+  confetti input at all**. Measured on a real frame: thresholding the prob map gives **2535
+  connected components, 98% under 100 px, median 3 px**. Region growing was cleaning up after a
+  broken foreground.
+- Also measured: supplying the confetti variance channels at inference (they are zero-filled by
+  design, with training-time channel dropout to match) changes nothing — 38.7% → 37.1%
+  multi-colour labels. Kept as an opt-in `predict_frame(variance_metrics=...)` argument, but it is
+  an enabler, not a fix.
+- **Objective now uses both signals in their roles** — *confetti is identity, flow is separation*
+  (Dominik). `score_label_size_confetti` maximises `Σ min(size, cap)²` over labels that are both
+  colour-pure and motion-coherent, divided by `cap × coloured pixels in the image`. Monotone in
+  both error directions, unlike counting `n_good`. The flow term catches same-colour merges that
+  confetti provably cannot see (~270 cells share each of 3 channels, so ~⅓ of merges are
+  same-colour); the image-derived denominator means missing a cell always costs — normalising by
+  *labelled* area instead was a bug in the first cut, reproducing the ratio trap.
+- **`ConfettiForegroundLoss` retrain failed and is off by default.** 80 epochs, 7 TRAIN movies,
+  scored on a held-out movie: baseline 428 labels/frame score **0.0768**; confetti-only 14
+  labels/frame score **0.0010**; confetti + half-intensity 100 labels/frame score **0.0355**. It
+  collapses detection — most likely target scaling (normalised by per-image max after blurring, so
+  typical cells fall below the 0.4 inference threshold), not the premise. Parked in `docs/TODO.md`.
+- **Process note.** The failure initially read as a large win because the diagnostics used
+  (fragment-%, multi-colour-%) have **no coverage term**: 14 labels/frame scored purity 1.000 and
+  4.3% under-segmentation. This is the same "ratio over a subset" trap that produced the original
+  bogus `BEST_PARAMS`, hit a third time in one session. Any segmentation metric used here must have
+  a coverage term.

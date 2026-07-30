@@ -36,6 +36,7 @@ try:
     from coastal.optimize import (
         optimize_segmentation_cma,
         score_segmentation,
+        score_label_size_confetti,
         optimize_tracking_cma,
         score_tracking_scalar,
         TRACKING_PARAM_BOUNDS,
@@ -101,6 +102,7 @@ __all__ = [
     "validate_training_data",
     "optimize_segmentation_cma",
     "score_segmentation",
+    "score_label_size_confetti",
     "optimize_tracking_cma",
     "score_tracking_scalar",
     "TRACKING_PARAM_BOUNDS",

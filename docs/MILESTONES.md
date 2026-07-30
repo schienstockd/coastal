@@ -140,6 +140,24 @@ Set up `github.com/schienstockd/coastal` and the contribution standards:
     `count_penalty_weight > 0`).
   - Set `merge_max_distance = 1.5` in the notebook to un-break merging. Measured effect on 5 real
     frames: 2366 → 2277 cells (**−3.8%**), so this is *not* on its own the Y-cell-splitting fix.
+- **Fixed the objective itself, then found it exonerates the parameters.** `score_segmentation` now
+  returns a **reward** — `n_good - junk_weight * (n_merged + n_fragmented)` — with purity computed
+  after per-channel background subtraction (`background_percentile=25`, `None` = legacy).
+  `tests/test_optimize_objective.py` pins the anti-gaming properties behaviourally: dropping a cell,
+  shrinking cells below `min_cell_size`, splitting one into fragments, over-merging two, or adding
+  junk must *each* lower the score, and "find nothing" cannot win. A synthetic case shows four
+  perfectly single-channel cells scoring 0 at **every** threshold with background left in, and 4/4
+  with it removed — so `purity_threshold`'s documented 0.7 default is usable again (baseline good
+  cells on the TEST movie: 171 at 0.7 subtracted, vs 140 under the old metric at a *lower* 0.4).
+- **Then swept `junk_weight` ∈ {0, 0.02, 0.05, 0.1, 0.3}, 200 evals each — and adopted nothing.**
+  `n_good` on the held-out TEST movie is **167–175 for every setting** except the extreme 0.3 (144);
+  what the parameters actually trade is the fragment count (1640–2280). At `junk_weight=0` the score
+  *is* `n_good`/frame, and it spanned **16.6–22.2** across the search with the shipped params already
+  at **20.8** — so these five inference parameters are worth **≤7%** and the shipped values are
+  already within that. Full table in `docs/OPTIMIZATION.md`. The bottleneck is training and
+  oversegmentation (**~86%** of detections are fragments), not the tuner; recorded in `docs/TODO.md`.
+- **Superseded the earlier ratio-based re-tune** (kept below for the record, since the gaming
+  behaviour is the reason the objective changed).
 - **Re-ran the tune with a working objective — and did not adopt the result.** With
   `purity_threshold=0.4` and a calibrated `count_penalty_weight`, CMA-ES gets a real gradient
   (0.02–0.28, no flat warning) and converges in ~2 min. But `affinity_threshold` pins to whatever the

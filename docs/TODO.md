@@ -34,21 +34,25 @@ what landed lives in `docs/MILESTONES.md` (and git history once this is a repo).
 - [ ] Hard-negative mining for any learned cost term.
 - [ ] Attention over track history (sequence, not frame pairs).
 
-### Optimization (blocks any meaningful segmentation re-tune)
-- [ ] **Make `score_segmentation` measure what we want before re-tuning.** Two independent defects,
-      both measured in `docs/OPTIMIZATION.md` → *The objective is gameable*:
-      (a) purity is computed on background-inclusive intensities, so it is floored at
-      `1/n_channels` and uses only **34%** of its range (median 0.385); subtracting each channel's
-      25th percentile first gives median **0.709** and **90%** of the range, which would also make
-      the documented `purity_threshold=0.7` default usable again.
-      (b) the score is `n_good / n_large`, a ratio over a subset, so the search maximises it by
-      pushing large cells into the near-free fragment bin — a re-tune raised the score from 0.429
-      to 0.523 while the absolute count of good cells *fell* from 140 to 116, and
-      `affinity_threshold` pinned to every upper bound it was given.
-      Both are numeric-behaviour changes to the objective (they redefine "good"), so decide the
-      intent first. Then re-tune and update the notebook's `BEST_PARAMS`.
-- [ ] Consider whether fragmentation should be the primary target: **1951 of 2277** detections on a
-      real TEST movie are below `min_cell_size=100`.
+### Optimization
+- [ ] **Stop tuning the 5 inference parameters; they are worth ≤7%.** Measured with the fixed
+      objective: `n_good` on a held-out movie is 167–175 across every `junk_weight` setting, and the
+      shipped params are already within 7% of the best found. See `docs/OPTIMIZATION.md` → *these 5
+      parameters are not the lever*. Redirect to training / oversegmentation.
+- [ ] Decide a `junk_weight` if the tuner is used again — it encodes how many fragments a real cell is
+      worth, which is a scientific choice, not a default. It also flips which way
+      `affinity_threshold` is pushed.
+- [ ] Check whether `score_tracking_scalar` has the same "ratio over a subset" flaw — i.e. whether it
+      can be improved by producing *fewer* tracks.
+- [ ] Several parameters still pin at their bounds under the fixed objective (`prob_weight` at 0.0,
+      `affinity_threshold` at 0.6). Low priority given the ≤7% headroom, but it means the bounds, not
+      the data, are choosing those values.
+
+### Segmentation quality (the actual bottleneck)
+- [ ] **~86% of detections are fragments** (1951 of 2277 below `min_cell_size=100` on a real TEST
+      movie), and inference parameters cannot fix it — they only shuffle the fragment population
+      (1640–2280 across a full tuning sweep) while `n_good` stays flat. This is a training / model
+      problem: the prob map and embeddings decide what is findable. Next lever, not the tuner.
 
 ### Segmentation
 - [ ] Reduce Y-cell splitting without over-merging (current mitigation: merge threshold > 0.90).

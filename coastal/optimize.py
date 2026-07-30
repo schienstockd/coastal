@@ -44,28 +44,53 @@ def _vec_to_params(x):
 
 
 def score_segmentation(results, frames_multi, min_cell_size=100,
-                       purity_threshold=0.7, count_penalty_weight=0.0,
+                       purity_threshold=0.7, background_percentile=25,
+                       junk_weight=0.05, count_penalty_weight=0.0,
                        verbose=False):
     """
-    Score segmentation quality using channel purity and a total cell count penalty.
+    Score segmentation quality: count the plausible cells, penalise the junk.
 
-    Labels are classified as:
+    Labels are classified per frame as:
       - good:       large (>= min_cell_size) AND dominant channel >= purity_threshold
       - merged:     large but impure — multiple channel types blended
       - fragmented: too small (< min_cell_size)
 
-    Purity is computed on large cells only. The count penalty applies to ALL cells
-    (large + fragments) so the optimizer discourages both oversegmentation into large
-    pieces and into small fragments equally.
+    Frame score = n_good - junk_weight * (n_merged + n_fragmented)
+                  - count_penalty_weight * n_total
 
-    Frame score = purity - count_penalty_weight * (n_large + n_fragmented)
+    averaged over frames. Higher is better; it can go negative. No ground-truth masks
+    are involved — "good" is a confetti-purity proxy, not a verified cell.
+
+    **This is a reward, not a ratio, on purpose.** It previously returned
+    `n_good / n_large`, which a tuner maximises by *discarding* cells: tighten
+    `affinity_threshold`, large cells drop into the (nearly free) fragment bin, and the
+    surviving fraction looks purer. Measured on a real movie, that let the score climb
+    0.429 -> 0.523 while the absolute number of good cells fell 140 -> 116, and
+    `affinity_threshold` pinned to every upper bound it was given. In the reward form
+    every way of losing a good cell costs at least 1, so there is no such gradient —
+    `tests/test_optimize_objective.py` pins that. See docs/OPTIMIZATION.md.
 
     Args:
         results:              list of result dicts from predict_sequence / predict_frame
         frames_multi:         [T, C, H, W] raw multi-channel frames (uint8 or float)
         min_cell_size:        pixel threshold below which a label is "fragmented" (default 100)
-        purity_threshold:     dominant-channel fraction above which a cell is "good" (default 0.7)
-        count_penalty_weight: penalty per cell found, large or fragment (default 0.0 = off)
+        purity_threshold:     dominant-channel fraction above which a cell is "good"
+                              (default 0.7 — meaningful only with background_percentile set,
+                              see below)
+        background_percentile: per-channel percentile subtracted before computing purity
+                              (default 25; None = don't subtract, the legacy behaviour).
+                              Purity is `max(mean_ch / mean_ch.sum())`, so it is floored at
+                              1/n_channels; on background-inclusive intensities it sits just
+                              above that floor and cannot discriminate. Measured over 326
+                              large cells in a real movie: median 0.385 spanning 34% of the
+                              usable range without subtraction, vs median 0.709 spanning 90%
+                              with it. Without subtraction any purity_threshold >= 0.6 makes
+                              the score identically zero.
+        junk_weight:          cost per merged or fragmented label (default 0.05). This is the
+                              recall/precision dial: 0 optimises raw cell count, large values
+                              optimise cleanliness. Fragments dominate it in practice because
+                              they dominate the counts.
+        count_penalty_weight: extra penalty per label found, of any class (default 0.0 = off)
         verbose:              print per-frame counts (default False)
 
     Returns:
@@ -84,6 +109,12 @@ def score_segmentation(results, frames_multi, min_cell_size=100,
 
         instances = result['instances']
         frame = frames_arr[t]  # [C, H, W]
+
+        if background_percentile is not None:
+            # Remove each channel's background floor, otherwise every cell reads as an
+            # even mix of all channels and purity collapses toward 1/C.
+            bg = np.percentile(frame.reshape(C, -1), background_percentile, axis=1)
+            frame = np.clip(frame - bg[:, None, None], 0, None)
 
         ch_mean = frame.mean(axis=(1, 2))  # [C]
         frame_norm = frame / (ch_mean[:, None, None] + 1e-6)
@@ -119,18 +150,17 @@ def score_segmentation(results, frames_multi, min_cell_size=100,
             else:
                 n_merged += 1
 
-        n_large = n_good + n_merged
-        n_total = n_large + n_fragmented
-        purity_score = n_good / n_large if n_large > 0 else 0.0
+        n_total = n_good + n_merged + n_fragmented
+        junk_penalty = junk_weight * (n_merged + n_fragmented)
         count_penalty = count_penalty_weight * n_total
 
-        score = purity_score - count_penalty
+        score = n_good - junk_penalty - count_penalty
         frame_scores.append(score)
 
         if verbose:
             print(f"  Frame {t}: {n_total} total | "
                   f"{n_good} good | {n_merged} merged | {n_fragmented} fragmented | "
-                  f"purity={purity_score:.3f} | count_penalty={count_penalty:.3f} | "
+                  f"junk_penalty={junk_penalty:.2f} | count_penalty={count_penalty:.2f} | "
                   f"score={score:.3f}")
 
     return float(np.mean(frame_scores)) if frame_scores else 0.0
@@ -147,6 +177,8 @@ def optimize_segmentation_cma(
     n_frames=5,
     min_cell_size=100,
     purity_threshold=0.7,
+    background_percentile=25,
+    junk_weight=0.05,
     count_penalty_weight=0.0,
     fixed_params=None,
     device=None,
@@ -154,26 +186,24 @@ def optimize_segmentation_cma(
     """
     CMA-ES optimization of LearnedAffinityInference parameters.
 
-    Optimizes 5 core parameters to maximise the fraction of LARGE cells classified as
-    "good" (single-channel-dominant).  Each cell is labelled:
+    Optimizes the 5 parameters in PARAM_NAMES to maximise the number of plausible cells
+    found, net of a penalty on junk. Each label is classified as:
       - good:       >= min_cell_size px AND dominant channel >= purity_threshold
       - merged:     large but impure (multiple channel types blended)
       - fragmented: too small to be a real cell
 
-    Score = n_good / (n_good + n_merged) - count_penalty_weight * n_total, averaged over
-    n_frames (see score_segmentation, which is the actual implementation).
+    Score = n_good - junk_weight * (n_merged + n_fragmented) - count_penalty_weight *
+    n_total, averaged over n_frames (see score_segmentation, the actual implementation,
+    for why this is a reward rather than a ratio — a ratio is maximised by discarding
+    cells).
 
-    Two things about that score to keep in mind before trusting a result:
+    `junk_weight` is the dial that matters: 0 optimises raw cell count, large values
+    optimise cleanliness. Fragments dominate it in practice — on a real movie 1951 of
+    2277 labels were below min_cell_size — so it is effectively a fragmentation penalty.
 
-    * **Fragments are not in the denominator.** With the default count_penalty_weight=0
-      they carry no cost at all, so the search has no incentive to merge fragments back
-      together — and merging can only lower purity. Set count_penalty_weight > 0 if you
-      want fragmentation penalised.
-    * **purity_threshold must be inside the achievable range.** The statistic is
-      max(mean_ch / mean_ch.sum()) on background-inclusive intensities, so it is floored
-      near 1/n_channels and, on the confetti movies, tops out around 0.56. Ask for 0.7 or
-      0.8 and every candidate scores 0.0 — a flat objective, where the returned "best" is
-      just the first sample evaluated. This function now warns when that happens.
+    A flat objective still means the result is meaningless; this function warns when
+    every evaluation scored the same. The usual cause used to be purity_threshold above
+    the achievable range, which `background_percentile` fixes (see score_segmentation).
 
     Args:
         model:            trained UNet
@@ -217,6 +247,8 @@ def optimize_segmentation_cma(
             results, eval_frames_multi,
             min_cell_size=min_cell_size,
             purity_threshold=purity_threshold,
+            background_percentile=background_percentile,
+            junk_weight=junk_weight,
             count_penalty_weight=count_penalty_weight,
         )
         history.append((_vec_to_params(x), score))

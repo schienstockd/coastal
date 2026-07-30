@@ -122,12 +122,25 @@ Set up `github.com/schienstockd/coastal` and the contribution standards:
   `gaussian_filter(sigma=(s, s, 0))` call instead of 64 per-channel calls. **6.62 → 0.78 s/frame
   (8.5×)** with **bit-identical labels**, verified by replaying the pre-optimisation `segment.py`
   straight out of git against the new one over real frames. One z-slice at T=180: **≳20 min → 142 s**.
-- **Found while profiling:** `merge_max_distance < 1.0` disables fragment merging outright —
-  `distance_transform_edt(~mask)` is 0 on the fragment and ≥1 off it, so a sub-1 threshold selects
-  only the fragment's own pixels, which `& ~mask` removes. The notebook's CMA-ES-tuned `BEST_PARAMS`
-  use 0.6198, so merging (and with it the documented Y-cell-splitting mitigation) has been inert,
-  while still paying for ~600 whole-frame distance transforms per frame. Recorded in
-  `docs/SEGMENTATION.md` and pinned by a test; the tuning call itself is Dominik's.
+- **Found while profiling — the tuned `BEST_PARAMS` were never tuned.** Two independent degeneracies
+  in `optimize_segmentation_cma`, both now fixed or guarded:
+  - `merge_max_distance < 1.0` disables fragment merging outright (`distance_transform_edt(~mask)` is
+    0 on the fragment and ≥1 off it, so a sub-1 threshold selects only the fragment's own pixels,
+    which `& ~mask` removes). The search bound was `(0.5, 3.0)` — a third of it a flat dead zone —
+    now floored at **1.0** and pinned by a test.
+  - `score_segmentation`'s `purity_threshold` was above the achievable range. Measured on a real
+    movie (344 large cells): purity median **0.395**, max **0.558**, floored near `1/n_channels`
+    because `frame / ch_mean` never subtracts background. At the notebook's `purity_threshold=0.8`
+    every candidate scores exactly **0.0**, and `max(history, ...)` returns the *first* tie — so
+    `BEST_PARAMS` is the first sample CMA-ES drew, not an optimum. That explains both the disabled
+    merging and a `merge_affinity_threshold` (0.2261) below `affinity_threshold` (0.5534), which the
+    docstring calls unusual. `optimize_segmentation_cma` now **warns loudly** when the objective
+    never varied, and its docstring no longer misstates the formula (it is
+    `n_good / (n_good + n_merged)`, with fragments excluded from the denominator and free unless
+    `count_penalty_weight > 0`).
+  - Set `merge_max_distance = 1.5` in the notebook to un-break merging. Measured effect on 5 real
+    frames: 2366 → 2277 cells (**−3.8%**), so this is *not* on its own the Y-cell-splitting fix. Full
+    re-tuning with a non-degenerate objective is Dominik's call — recorded in `docs/OPTIMIZATION.md`.
 - **Measured on the box** (not estimated): peak RSS for one in-flight z-slice at T=180 went
   **~7.0 GB → 4.65 GB** (incl. the Torch/CUDA context), which lifts the notebook's `SEG_WORKERS`
   from 2 to 4 on 31 GB — with ~6 as the ceiling. Together with the loop work a 15-slice movie goes

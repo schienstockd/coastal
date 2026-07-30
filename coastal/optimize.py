@@ -20,7 +20,12 @@ PARAM_BOUNDS = {
     # 'prob_threshold':                      (0.2, 0.5),
     'affinity_threshold':                  (0.2, 0.6),
     'merge_affinity_threshold':            (0.2, 0.6),
-    'merge_max_distance':                  (0.5, 3.0),
+    # Floored at 1.0: distance_transform_edt(~mask) is 0 on a fragment and >=1 off it, so any
+    # value below 1 selects only the fragment's own pixels — which are then excluded — and
+    # merging is silently disabled. The old (0.5, ...) bound let the search sit in that dead
+    # zone, where the score is flat because the parameter has no effect. See
+    # docs/OPTIMIZATION.md.
+    'merge_max_distance':                  (1.0, 3.0),
     'merge_contact_brightness_threshold':  (0.2, 0.6),
     'prob_weight':                         (0.0, 0.6),
 }
@@ -145,13 +150,26 @@ def optimize_segmentation_cma(
     """
     CMA-ES optimization of LearnedAffinityInference parameters.
 
-    Optimizes 5 core parameters to maximise the fraction of cells classified as
-    "good" (large and single-channel-dominant).  Each cell is labelled:
+    Optimizes 5 core parameters to maximise the fraction of LARGE cells classified as
+    "good" (single-channel-dominant).  Each cell is labelled:
       - good:       >= min_cell_size px AND dominant channel >= purity_threshold
       - merged:     large but impure (multiple channel types blended)
       - fragmented: too small to be a real cell
 
-    Score = n_good / (n_good + n_merged + n_fragmented) averaged over n_frames.
+    Score = n_good / (n_good + n_merged) - count_penalty_weight * n_total, averaged over
+    n_frames (see score_segmentation, which is the actual implementation).
+
+    Two things about that score to keep in mind before trusting a result:
+
+    * **Fragments are not in the denominator.** With the default count_penalty_weight=0
+      they carry no cost at all, so the search has no incentive to merge fragments back
+      together — and merging can only lower purity. Set count_penalty_weight > 0 if you
+      want fragmentation penalised.
+    * **purity_threshold must be inside the achievable range.** The statistic is
+      max(mean_ch / mean_ch.sum()) on background-inclusive intensities, so it is floored
+      near 1/n_channels and, on the confetti movies, tops out around 0.56. Ask for 0.7 or
+      0.8 and every candidate scores 0.0 — a flat objective, where the returned "best" is
+      just the first sample evaluated. This function now warns when that happens.
 
     Args:
         model:            trained UNet
@@ -237,6 +255,24 @@ def optimize_segmentation_cma(
     print("Best parameters:")
     for name in PARAM_NAMES:
         print(f"  {name}: {best_params[name]:.4f}")
+
+    # A flat objective returns whichever sample came first, which looks exactly like a
+    # successful tune. Say so loudly instead: this is how a parameter set with merging
+    # silently disabled came to be treated as "the tuned best".
+    scores = [s for _, s in history]
+    if scores and max(scores) == min(scores):
+        flat_at = scores[0]
+        print(
+            f"\n*** WARNING: the objective never varied (every one of {len(scores)} "
+            f"evaluations scored {flat_at:.4f}). ***\n"
+            f"    These parameters are just the first sample evaluated, NOT an optimum.\n"
+            + (f"    n_good was 0 everywhere: purity_threshold={purity_threshold} is above the\n"
+               f"    achievable range for this data. Inspect the purity distribution and lower it\n"
+               f"    (~0.4-0.5 on the confetti movies), then re-run.\n"
+               if flat_at == 0.0 else
+               "    Widen the bounds or change the objective; the search had nothing to climb.\n")
+            + "    See docs/OPTIMIZATION.md -> Degenerate objectives."
+        )
 
     return best_params, history
 

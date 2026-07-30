@@ -249,3 +249,22 @@ def test_merge_below_one_pixel_cannot_merge():
     merged = _seg(merge_max_distance=1.0, min_component_size=1)._merge_split_instances(
         inst.copy(), emb, prob)
     assert set(np.unique(merged)) == {0, 1}
+
+
+# --------------------------------------------------------------------------- #
+# Tuning guards (docs/OPTIMIZATION.md -> Degenerate objectives)                 #
+# --------------------------------------------------------------------------- #
+
+def test_merge_max_distance_bound_cannot_disable_merging():
+    """CMA-ES must not be able to pick a sub-1px merge distance.
+
+    Below 1 the candidate set is always empty (see
+    test_merge_below_one_pixel_cannot_merge), so the parameter has no effect and the
+    objective goes flat — which is how the notebook's BEST_PARAMS ended up with merging
+    silently off.
+    """
+    from coastal.optimize import PARAM_BOUNDS
+
+    lo, hi = PARAM_BOUNDS['merge_max_distance']
+    assert lo >= 1.0, f'lower bound {lo} lets the search disable merging'
+    assert hi > lo

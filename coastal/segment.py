@@ -212,19 +212,37 @@ class LearnedAffinityInference:
         self.max_iter = max_iter
         self.min_component_size = min_component_size
 
-    def predict_frame(self, frame, metrics_dict):
-        """Segment using seed-based region growing with embedding+prob-based merging."""
+    def predict_frame(self, frame, metrics_dict, variance_metrics=None):
+        """Segment using seed-based region growing with embedding+prob-based merging.
+
+        Args:
+            frame:            [H, W] projected frame
+            metrics_dict:     the temporal (flow) metrics for this frame
+            variance_metrics: optional cross-channel (confetti) metrics from
+                              `flow.compute_variance_metrics`. Training feeds these as the
+                              trailing input channels — `[frame, sorted(temporal),
+                              sorted(variance)]` — with channel dropout so the model also
+                              works without them, and inference has historically passed
+                              zeros there. Supplying them here fills those channels with the
+                              real signal instead, in the same order training used.
+        """
         frame_norm = (frame - frame.min()) / (frame.max() - frame.min() + 1e-5)
         frame_tensor = torch.from_numpy(frame_norm).float().unsqueeze(0).unsqueeze(0)
 
-        metric_list = []
-        for name in sorted(metrics_dict.keys()):
-            arr = metrics_dict[name]
-            if isinstance(arr, np.ndarray):
-                arr = torch.from_numpy(arr).float()
-            else:
-                arr = arr.float()
-            metric_list.append(arr)
+        def _stack(d):
+            out = []
+            for name in sorted(d.keys()):
+                arr = d[name]
+                out.append(torch.from_numpy(arr).float() if isinstance(arr, np.ndarray)
+                           else arr.float())
+            return out
+
+        # Order matters: training concatenates the temporal block then the variance block,
+        # each sorted within itself (see train.py::_stack_metrics), NOT one merged sort.
+        metric_list = _stack(metrics_dict)
+        n_temporal = len(metric_list)
+        if variance_metrics:
+            metric_list += _stack(variance_metrics)
 
         H, W = frame_tensor.shape[2:]
         if metric_list:
@@ -232,7 +250,7 @@ class LearnedAffinityInference:
         else:
             metrics_stacked = torch.zeros(1, 1, H, W)
 
-        # Pad with zeros for variance channels not available at inference.
+        # Zero-fill whatever the model expects beyond what was supplied.
         n_variance = max(0, self.model.num_metrics - len(metric_list))
         variance_zeros = torch.zeros(1, n_variance, H, W)
         frame_and_metrics = torch.cat([frame_tensor, metrics_stacked, variance_zeros], dim=1).to(self.device)

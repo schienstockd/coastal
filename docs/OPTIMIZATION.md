@@ -6,6 +6,42 @@
 CMA-ES hyperparameter tuning (`optimize.py`, ~424 LOC) for both subsystems, via
 `cma.CMAEvolutionStrategy` with a `BoundPenalty` boundary handler and an ask/tell loop.
 
+## What confetti can and cannot constrain
+
+The premise: a cell is a contiguous region of **one** confetti colour, so a label spanning two
+colours is a merge and a track changing colour is an ID switch. Two consequences that shape every
+objective here:
+
+- It guards **under**-segmentation only. A fragment of a single colour is perfectly pure, so purity
+  is blind to over-segmentation — which is ~86% of the observed errors.
+- It is a *partial* merge detector even for merges. With ~270 cells sharing each of 3 channels
+  (README), two merged cells have the same colour about a third of the time and the merge is
+  invisible. Adjacency of same-coloured labels is likewise mostly chance, not evidence of a split.
+
+So confetti cannot be the whole signal. The usable formulation (Dominik's) is **"the largest
+reasonable label size while preserving confetti"** — maximise size, with purity as the constraint and
+a cell-size cap supplying the "reasonable". That is `score_label_size_confetti`:
+
+```
+score = Σ over colour-pure labels of min(size, max_cell_size)²
+        ────────────────────────────────────────────────────────
+              max_cell_size × (coloured pixels in the IMAGE)
+```
+
+Unlike counting `n_good`, this is monotone in **both** error directions: splitting a pure label
+drops the numerator (`2·(s/2)² < s²`), merging two same-colour pieces of one cell raises it
+(`(a+b)² > a²+b²`), merging different colours zeroes that label, and covering a whole region with one
+giant label saturates at a single `cap²` and so loses to tiling it at cell size.
+
+The denominator counts colour-carrying pixels of the **image**, not of the labelling. That was a bug
+in the first cut: normalising by labelled area makes the score a quality ratio, so segmenting one
+perfect cell and ignoring the frame scores 1.0 — the same trap as the old `n_good / n_large`.
+`tests/test_optimize_objective.py` pins all of it.
+
+> **Open:** two scorers now exist (`score_segmentation`, `score_label_size_confetti`) and one should
+> go — see `docs/TODO.md`. `score_segmentation` is kept only because the tuning results below were
+> measured with it.
+
 ## Segmentation tuning
 
 - `optimize_segmentation_cma(...)` — searches the `LearnedAffinityInference` parameters listed in

@@ -2,6 +2,7 @@
 
 import numpy as np
 import cma
+from scipy import ndimage
 
 from coastal.segment import LearnedAffinityInference
 
@@ -43,12 +44,140 @@ def _vec_to_params(x):
             for i, name in enumerate(PARAM_NAMES)}
 
 
+def score_label_size_confetti(results, frames_multi, max_cell_size=300,
+                              purity_threshold=0.8, background_percentile=25,
+                              min_coloured_pixels=5, verbose=False):
+    """
+    "The largest reasonable label size while preserving confetti" (Dominik's formulation).
+
+    Confetti constrains segmentation from one side only: a label spanning two colours is a
+    merge error, but a fragment of a single colour looks perfectly pure. So purity alone
+    cannot see over-segmentation — which is ~86% of the errors. The fix is to make label
+    *size* the thing being maximised and colour purity the *constraint*:
+
+        score = sum over colour-pure labels of min(size, max_cell_size)**2
+                ----------------------------------------------------------
+                    max_cell_size * (coloured pixels in the IMAGE)
+
+    Every failure mode moves it the right way, which is what `n_good`-counting could not do:
+
+      * split a pure label in half   -> 2*(s/2)^2 < s^2                       score falls
+      * merge two same-colour pieces
+        of one cell                  -> (a+b)^2 > a^2 + b^2                   score rises
+      * merge two different-colour
+        cells                        -> label impure, contributes 0           score falls hard
+      * drop a label                 -> numerator loses its term              score falls
+      * grow one label over a whole
+        region instead of tiling it  -> numerator capped at one cap^2         score falls
+
+    The denominator counts colour-carrying pixels of the **image**, not of the labelling.
+    That is deliberate and was a bug on the first attempt: normalising by labelled area
+    makes the score a quality ratio, so segmenting a single perfect cell and ignoring the
+    rest of the frame scores 1.0 — the same "ratio over a subset" trap that made the old
+    `n_good / n_large` gameable. Against a fixed, image-derived denominator, missing a cell
+    always costs.
+
+    The cap is what makes it "reasonable". Without it the maximum is one enormous label, and
+    with only 3 confetti channels shared by ~270 cells each (see README) a huge label can be
+    colour-pure by accident, so an uncapped size reward would be gamed.
+
+    It is normalised to roughly [0, 1]: 1.0 means every labelled pixel belongs to a
+    colour-pure label of exactly max_cell_size.
+
+    Args:
+        results:              list of result dicts from predict_sequence / predict_frame
+        frames_multi:         [T, C, H, W] raw multi-channel frames
+        max_cell_size:        px area of a plausible cell — the "reasonable" cap. At
+                              0.497 um/px a ~8 um T cell is ~200 px in 2D projection, so
+                              300 is a generous single cell. Calibrate on your own data.
+        purity_threshold:     dominant-colour fraction required to count as one cell
+                              (default 0.8)
+        background_percentile: per-channel background subtracted before assigning colours
+                              (default 25; purity is meaningless without it — see
+                              score_segmentation)
+        min_coloured_pixels:  labels with fewer bright/coloured pixels than this cannot be
+                              judged, and are treated as impure (they still count in the
+                              denominator, so they are not free)
+        verbose:              print per-frame diagnostics
+
+    Returns:
+        scalar score in ~[0, 1], higher is better
+    """
+    frames_arr = np.asarray(frames_multi, dtype=np.float32)
+    if frames_arr.ndim == 3:
+        raise ValueError("frames_multi must be [T, C, H, W], not [T, H, W]")
+    T, C = frames_arr.shape[0], frames_arr.shape[1]
+
+    frame_scores = []
+
+    for t, result in enumerate(results):
+        if t >= T:
+            continue
+        instances = result['instances']
+        frame = frames_arr[t]
+
+        # Per-pixel confetti colour: brightest channel after background removal. Dim
+        # pixels get no colour so background cannot make a label look pure.
+        bg = np.percentile(frame.reshape(C, -1), background_percentile, axis=1)
+        sub = np.clip(frame - bg[:, None, None], 0, None)
+        bright = sub.max(axis=0)
+        colour = sub.argmax(axis=0)
+        colour[bright <= np.percentile(bright, 60)] = -1
+
+        # Fixed, image-derived denominator: how much colour-carrying tissue there is to
+        # account for. Independent of the labelling, so missing a cell cannot be free.
+        total_coloured = int((colour >= 0).sum())
+
+        numerator = 0.0
+        n_pure = n_impure = 0
+        pure_sizes = []
+
+        for label, sl in enumerate(ndimage.find_objects(instances), start=1):
+            if sl is None:
+                continue
+            mask = instances[sl] == label
+            size = int(mask.sum())
+
+            cols = colour[sl][mask]
+            cols = cols[cols >= 0]
+            if len(cols) < min_coloured_pixels:
+                n_impure += 1
+                continue
+            counts = np.bincount(cols, minlength=C)
+            if counts.max() / counts.sum() < purity_threshold:
+                n_impure += 1
+                continue
+
+            n_pure += 1
+            pure_sizes.append(size)
+            numerator += min(size, max_cell_size) ** 2
+
+        if total_coloured == 0:
+            continue
+        score = numerator / (max_cell_size * total_coloured)
+        frame_scores.append(score)
+
+        if verbose:
+            med = float(np.median(pure_sizes)) if pure_sizes else 0.0
+            print(f"  Frame {t}: {n_pure} pure / {n_pure + n_impure} labels | "
+                  f"median pure size {med:.0f}px (cap {max_cell_size}) | "
+                  f"coloured area {total_coloured}px | score={score:.4f}")
+
+    return float(np.mean(frame_scores)) if frame_scores else 0.0
+
+
 def score_segmentation(results, frames_multi, min_cell_size=100,
                        purity_threshold=0.7, background_percentile=25,
                        junk_weight=0.05, count_penalty_weight=0.0,
                        verbose=False):
     """
     Score segmentation quality: count the plausible cells, penalise the junk.
+
+    NOTE: prefer `score_label_size_confetti`. This one thresholds size into a binary
+    good/fragment decision, so it is only weakly sensitive to over-segmentation; the other
+    maximises label size subject to colour purity, which is what confetti can actually
+    constrain. Kept because the tuning results recorded in docs/OPTIMIZATION.md were
+    measured with it.
 
     Labels are classified per frame as:
       - good:       large (>= min_cell_size) AND dominant channel >= purity_threshold

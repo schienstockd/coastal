@@ -35,6 +35,14 @@ what landed lives in `docs/MILESTONES.md` (and git history once this is a repo).
 - [ ] Attention over track history (sequence, not frame pairs).
 
 ### Optimization
+- [ ] **Two scorers exist; delete one.** `score_label_size_confetti` is the better-motivated
+      objective ("largest reasonable label size while preserving confetti", monotone in both error
+      directions); `score_segmentation` counts `n_good` and is only weakly sensitive to
+      over-segmentation. The latter is kept only because the tuning sweep in
+      `docs/OPTIMIZATION.md` was measured with it. Once a re-tune is run against the size objective,
+      delete `score_segmentation` and its `junk_weight`/`count_penalty_weight` knobs.
+- [ ] Calibrate `max_cell_size` on real data (default 300 px ≈ an 8 µm cell at 0.497 µm/px). It sets
+      what "reasonable" means and therefore how hard merging is pushed.
 - [ ] **Stop tuning the 5 inference parameters; they are worth ≤7%.** Measured with the fixed
       objective: `n_good` on a held-out movie is 167–175 across every `junk_weight` setting, and the
       shipped params are already within 7% of the best found. See `docs/OPTIMIZATION.md` → *these 5

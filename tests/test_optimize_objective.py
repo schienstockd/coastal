@@ -136,3 +136,97 @@ def test_background_subtraction_is_what_makes_purity_usable():
                                purity_threshold=0.7, background_percentile=25,
                                junk_weight=0.0)
     assert fixed == pytest.approx(4.0)
+
+
+# --------------------------------------------------------------------------- #
+# score_label_size_confetti: "largest reasonable label size, preserving confetti"  #
+# --------------------------------------------------------------------------- #
+
+from coastal.optimize import score_label_size_confetti
+
+CAP = 400          # "reasonable" cell area for these synthetic cells
+
+
+def _sized_frames(n_ch=3, regions=((5, 5, 20, 20, 0), (5, 35, 20, 20, 1))):
+    """Background-dominated frame with one dominant channel per region."""
+    f = np.full((1, n_ch, H, W), BACKGROUND, dtype=np.float32)
+    for y, x, h, w, ch in regions:
+        f[0, ch, y:y + h, x:x + w] += CELL_EXCESS
+    return f
+
+
+def _inst(layout):
+    inst = np.zeros((H, W), dtype=np.int32)
+    for y, x, h, w, lab in layout:
+        inst[y:y + h, x:x + w] = lab
+    return [{'instances': inst}]
+
+
+def _size_score(layout, frames=None, **kw):
+    params = dict(max_cell_size=CAP, purity_threshold=0.8)
+    params.update(kw)
+    return score_label_size_confetti(_inst(layout), frames if frames is not None
+                                     else _sized_frames(), **params)
+
+
+TWO_CELLS = [(5, 5, 20, 20, 1), (5, 35, 20, 20, 2)]     # 400 px each, one colour each
+
+
+def test_splitting_a_pure_label_lowers_the_score():
+    """The failure purity alone is blind to."""
+    whole = _size_score(TWO_CELLS)
+    split = _size_score([(5, 5, 20, 10, 1), (5, 15, 20, 10, 3), (5, 35, 20, 20, 2)])
+    assert split < whole
+
+
+def test_merging_same_colour_pieces_of_one_cell_raises_the_score():
+    """Two fragments of one cell should prefer being one label."""
+    split = _size_score([(5, 5, 20, 10, 1), (5, 15, 20, 10, 3), (5, 35, 20, 20, 2)])
+    whole = _size_score(TWO_CELLS)
+    assert whole > split
+
+
+def test_merging_two_different_colour_cells_lowers_the_score():
+    """The confetti constraint: one label spanning two colours is a merge error."""
+    separate = _size_score(TWO_CELLS)
+    merged = _size_score([(5, 5, 20, 50, 1)])       # spans both coloured regions
+    assert merged < separate
+
+
+def test_tiling_a_region_at_cell_size_beats_one_giant_label():
+    """'Largest REASONABLE size' — the cap is what stops runaway merging.
+
+    With only 3 confetti channels shared by ~270 cells each, a big label can be colour-pure
+    by accident, so the size reward has to saturate. One label over a whole single-colour
+    region must therefore lose to several cell-sized ones covering the same area.
+    """
+    region = ((5, 5, 20, 60, 0),)                 # 1200 px of one colour = 3x the cap
+    frames = _sized_frames(regions=region)
+    giant = _size_score([(5, 5, 20, 60, 1)], frames=frames)
+    tiled = _size_score([(5, 5, 20, 20, 1), (5, 25, 20, 20, 2), (5, 45, 20, 20, 3)],
+                        frames=frames)
+    assert giant < tiled
+    assert giant == pytest.approx(CAP / 1200, abs=0.05)   # saturated at one cap^2
+
+
+def test_dropping_a_label_lowers_the_score():
+    """Missing a cell must cost — the denominator is image-derived, not label-derived.
+
+    Normalising by labelled area instead would make this pass at 1.0 either way, i.e. a
+    quality ratio that rewards segmenting one cell and ignoring the rest.
+    """
+    assert _size_score(TWO_CELLS[:1]) < _size_score(TWO_CELLS)
+
+
+def test_perfect_cell_sized_pure_labels_approach_one():
+    """Normalisation sanity: all labelled area pure and exactly at the cap -> ~1.0."""
+    assert _size_score(TWO_CELLS) == pytest.approx(1.0, abs=0.05)
+
+
+def test_impure_labels_still_count_in_the_denominator():
+    """An impure label must cost, not merely fail to contribute."""
+    pure_only = _size_score(TWO_CELLS[:1], frames=_sized_frames(
+        regions=((5, 5, 20, 20, 0),)))
+    plus_impure = _size_score(TWO_CELLS[:1] + [(40, 5, 20, 50, 9)], frames=_sized_frames(
+        regions=((5, 5, 20, 20, 0), (40, 5, 20, 25, 1), (40, 30, 20, 25, 2))))
+    assert plus_impure < pure_only

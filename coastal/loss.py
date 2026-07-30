@@ -5,8 +5,86 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ConfettiForegroundLoss(nn.Module):
+    """Probability guidance from confetti colour instead of grayscale texture.
+
+    The premise (Dominik's): a cell is a contiguous region of ONE confetti colour, so a
+    region spanning several colours is a segmentation error. That makes "one colour
+    dominates here, brightly" a foreground signal — and unlike intensity/edge statistics
+    it is smooth across a cell interior rather than peaking at boundaries and on noise.
+
+    Why this exists: `IntensityLoss` builds its target as
+    `0.5*bright + 0.3*local_contrast + 0.2*edge`, i.e. half a per-pixel intensity
+    threshold and half two edge detectors, with no notion of a cell-sized object and no
+    confetti input at all. Measured on a real frame, the resulting prob map thresholds
+    into **2535 connected components, 98% of them under 100 px, median 3 px** — the model
+    is being asked to reproduce speckle, which is the origin of the ~86% fragment rate
+    downstream. See docs/SEGMENTATION.md.
+
+    The target is built from the variance metrics already computed for training
+    (`flow.compute_variance_metrics` → `softmax_ch_*`), which are a per-channel local
+    softmax scaled by brightness. Their per-pixel max is therefore high only where one
+    channel clearly dominates and the pixel is bright: cell interiors, not background and
+    not colour-ambiguous overlaps. A blur at roughly cell scale turns it from a per-pixel
+    statistic into a blob-shaped objective.
+
+    Note this guards **under**-segmentation only. A fragment of a single colour looks
+    perfectly good to this signal, so it cannot penalise over-segmentation on its own —
+    the blur is what supplies a size prior.
+    """
+
+    def __init__(self, blur_sigma: float = 2.0):
+        super().__init__()
+        self.blur_sigma = blur_sigma
+
+    def _blur(self, x):
+        """Separable Gaussian at cell scale, so the target is blobs not pixels."""
+        if self.blur_sigma <= 0:
+            return x
+        radius = max(1, int(3 * self.blur_sigma))
+        coords = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+        k = torch.exp(-(coords ** 2) / (2 * self.blur_sigma ** 2))
+        k = k / k.sum()
+        x = F.conv2d(x, k.view(1, 1, 1, -1), padding=(0, radius))
+        return F.conv2d(x, k.view(1, 1, -1, 1), padding=(radius, 0))
+
+    def forward(self, pred_prob, variance_metrics):
+        """
+        Args:
+            pred_prob:         [B, 1, H, W] raw model logits (before sigmoid)
+            variance_metrics:  list of B dicts with `softmax_ch_*` [H, W] arrays
+        Returns:
+            BCE against the confetti foreground target, or 0.0 if no metrics supplied.
+        """
+        targets = []
+        for m in variance_metrics:
+            keys = sorted(k for k in m.keys() if k.startswith('softmax_ch_'))
+            if not keys:
+                return torch.zeros((), device=pred_prob.device, dtype=torch.float32)
+            stack = torch.stack([
+                (v if isinstance(v, torch.Tensor) else torch.from_numpy(v))
+                .to(pred_prob.device).float()
+                for v in (m[k] for k in keys)
+            ], dim=0)                                   # [C, H, W]
+            targets.append(stack.max(dim=0).values)     # dominant-colour confidence
+        target = torch.stack(targets, dim=0).unsqueeze(1)   # [B, 1, H, W]
+        target = self._blur(target)
+        # Rescale per image so the brightest cells read as foreground.
+        flat = target.view(target.size(0), -1)
+        hi = flat.max(dim=1).values.view(-1, 1, 1, 1) + 1e-6
+        target = torch.clamp(target / hi, 0, 1)
+        return F.binary_cross_entropy_with_logits(pred_prob.float(), target)
+
+
 class IntensityLoss(nn.Module):
-    """Probability guidance using intensity + contrast + edges."""
+    """Probability guidance using intensity + contrast + edges.
+
+    NOTE: the target is `0.5*bright + 0.3*local_contrast + 0.2*edge` — half a per-pixel
+    intensity threshold, half two edge detectors — so it has no cell-scale structure and
+    ignores confetti entirely. It trains the prob head to reproduce speckle (measured:
+    2535 components per frame, median 3 px). Prefer `ConfettiForegroundLoss`; see
+    docs/SEGMENTATION.md.
+    """
 
     def forward(self, pred_prob, frame):
         """

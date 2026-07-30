@@ -6,7 +6,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 
 from coastal.model import UNetWithEmbeddings
-from coastal.loss import IntensityLoss, TemporalMetricsLoss, VarianceMetricsLoss, WarpConsistencyLoss
+from coastal.loss import ConfettiForegroundLoss, IntensityLoss, TemporalMetricsLoss, VarianceMetricsLoss, WarpConsistencyLoss
 from coastal.device import resolve_device
 
 
@@ -199,7 +199,8 @@ def train_test_split_per_movie(all_frames, all_metrics, train_ratio=0.8, shuffle
 def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm=None,
                        num_epochs=50, batch_size=1, seed=42, device=None, embedding_dim=16,
                        variance_weight=1.0, intensity_weight=1.0, temporal_weight=2.0,
-                       warp_weight=0.0, flow_pairs=None,
+                       warp_weight=0.0, confetti_weight=0.0, confetti_blur_sigma=2.0,
+                       flow_pairs=None,
                        max_grad_norm=1.0, variance_window_size=32, variance_dropout_p=0.5,
                        num_workers=4, use_amp=True):
     """
@@ -215,7 +216,15 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
         device: cuda or cpu
         embedding_dim: embedding dimension
         variance_weight: weight for VarianceMetricsLoss (contrastive on variance, default 1.0)
-        intensity_weight: weight for IntensityLoss (default 1.0)
+        intensity_weight: weight for IntensityLoss (default 1.0). Its target is half a
+                          per-pixel intensity threshold and half two edge detectors, so it
+                          trains the prob head toward speckle — measured 2535 components
+                          per frame, median 3 px. Turn it down when using confetti_weight.
+        confetti_weight:  weight for ConfettiForegroundLoss (default 0.0 = off). Supervises
+                          the prob head with "one confetti colour dominates here, brightly",
+                          blurred to cell scale, instead of grayscale texture. Needs
+                          variance_metrics_norm. See docs/SEGMENTATION.md.
+        confetti_blur_sigma: cell-scale blur for that target (default 2.0 px)
         temporal_weight: weight for TemporalMetricsLoss (default 2.0)
         max_grad_norm: gradient clipping threshold (default 1.0)
         variance_window_size: spatial window size for windowed variance contrastive loss (default 32)
@@ -292,6 +301,8 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     print(f"Dataset size: {len(dataset)} frames\n")
 
     loss_intensity = IntensityLoss().to(device)
+    loss_confetti = ConfettiForegroundLoss(blur_sigma=confetti_blur_sigma).to(device) \
+        if confetti_weight > 0.0 else None
     loss_temporal = TemporalMetricsLoss().to(device)
     loss_variance = VarianceMetricsLoss(window_size=variance_window_size).to(device)
     loss_warp = WarpConsistencyLoss().to(device) if warp_weight > 0.0 else None
@@ -305,6 +316,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
         'intensity': [],
         'temporal': [],
         'warp': [],
+        'confetti': [],
     }
 
     for epoch in range(num_epochs):
@@ -315,6 +327,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             'intensity': 0.0,
             'temporal': 0.0,
             'warp': 0.0,
+            'confetti': 0.0,
         }
 
         for batch_idx, batch in enumerate(dataloader):
@@ -343,6 +356,8 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                 metric_emb = model.emb_head(decoded)
 
                 l_intensity = loss_intensity(pred_prob, channels)
+                l_confetti = loss_confetti(pred_prob, v_metrics) if loss_confetti is not None \
+                    else torch.tensor(0.0, device=device)
                 l_temporal = loss_temporal(metric_emb, t_metrics)
                 l_variance = loss_variance(metric_emb, v_metrics, frame_indices=frame_indices) if use_variance else \
                     torch.tensor(0.0, device=device)
@@ -363,7 +378,8 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                 total_loss = (intensity_weight * l_intensity +
                              temporal_weight * l_temporal +
                              variance_weight * l_variance +
-                             warp_weight * l_warp)
+                             warp_weight * l_warp +
+                             confetti_weight * l_confetti)
 
             optimizer.zero_grad()
             scaler.scale(total_loss).backward()
@@ -380,6 +396,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             epoch_losses['intensity'] += l_intensity.item()
             epoch_losses['temporal'] += l_temporal.item()
             epoch_losses['warp'] += l_warp.item()
+            epoch_losses['confetti'] += l_confetti.item()
 
         n = len(dataloader)
         for key in epoch_losses:
@@ -388,12 +405,13 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             warp_str = f" | warp={epoch_losses['warp']:.4f}" if warp_weight > 0 else ""
+            conf_str = f" | conf={epoch_losses['confetti']:.4f}" if confetti_weight > 0 else ""
             print(f"Epoch {epoch+1:3d}/{num_epochs}: "
                   f"total={epoch_losses['total']:.4f} | "
                   f"int={epoch_losses['intensity']:.4f} | "
                   f"tmp={epoch_losses['temporal']:.4f} | "
                   f"var={epoch_losses['variance']:.4f}"
-                  + warp_str)
+                  + warp_str + conf_str)
 
     print(f"\nFinal losses:")
     print(f"  Total:     {history['total'][-1]:.4f}")

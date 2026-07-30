@@ -29,11 +29,11 @@ coastal PR #7) and cecelia's bridge render identically.
 - cecelia's **importable** package is the light IO tier (`pip install cecelia` pulls no napari —
   napari is an *environment* dep in cecelia's `pixi.toml`). So the new module ships in the wheel but
   must **lazily import napari** (napari provided by the pixi env), like cecelia's other heavy modules.
-  See `../cecelia/cecelia-pineapple/docs/todo/PY_PACKAGING_PLAN.md`.
+  See `../cecelia/cecelia-feijoa/docs/todo/PY_PACKAGING_PLAN.md`.
 
 ## Decisions (2026-07-13)
 
-1. **Location:** `cecelia-pineapple:python/cecelia/utils/napari_utils.py`. Lazy `import napari`
+1. **Location:** `cecelia-feijoa:python/cecelia/utils/napari_utils.py`. Lazy `import napari`
    inside functions; module top imports only numpy. cecelia code style (2-space indent, module
    docstring like `dim_utils.py`).
 2. **API (generic, array-level — no disk, no project state, no layer reconciliation):**
@@ -78,14 +78,14 @@ coastal PR #7) and cecelia's bridge render identically.
 
 - `coastal/napari_viz.py` (reference implementation), coastal PR #7:
   https://github.com/schienstockd/coastal/pull/7
-- cecelia bridge: `../cecelia/cecelia-pineapple/napari/napari_bridge.py`
+- cecelia bridge: `../cecelia/cecelia-feijoa/napari/napari_bridge.py`
   (`add_image` ~L126, `show_labels`→`add_labels` ~L273, `show_tracks`→`add_tracks` ~L656).
 - cecelia packaging (light-tier / lazy-napari rationale):
-  `../cecelia/cecelia-pineapple/docs/todo/PY_PACKAGING_PLAN.md`.
+  `../cecelia/cecelia-feijoa/docs/todo/PY_PACKAGING_PLAN.md`.
 
 ## Handoff
 
 No live channel between Claude Code sessions — this file *is* the handoff. To execute, point the
 cecelia session at this plan (sibling path `../coastal/docs/todo/CECELIA_NAPARI_UPSTREAM_PLAN.md`),
-or copy it into `cecelia-pineapple/docs/todo/` once `feat/umap-facet` merges so cecelia finds it
-natively. Promote to `cecelia-pineapple/docs/NAPARI.md` (or similar) once shipped.
+or copy it into `cecelia-feijoa/docs/todo/` once `feat/umap-facet` merges so cecelia finds it
+natively. Promote to `cecelia-feijoa/docs/NAPARI.md` (or similar) once shipped.

@@ -304,3 +304,87 @@ self-supervision — preserve that chain even in a clean reimplementation.
   https://www.biorxiv.org/content/10.1101/2023.06.01.543361v1
 - Flow-calibrated self-supervised video denoising, arXiv 2412.11820 (the transplanted technique).
 - CARE / CSBDeep, Weigert et al., *Nat Methods* 2018 (upstream attribution).
+
+
+---
+
+## Measured provenance + denoise findings (2026-07-31)
+
+Recorded because it was slow to recover and is needed the moment the re-processed project lands.
+
+### What the current movies actually are
+
+`ccidDriftCorrected.zarr` is **already cellpose-denoised** — the name does not say so. From the
+per-image cecelia logs (`ANALYSIS/1/<uid>/log/`) for `fFnZOv`:
+
+| step | when |
+|---|---|
+| `importImages.omezarr` — bioformats2raw 0.11.0, `.oir` → `ccidImage.ome.zarr` | 2026-06-18 12:21 |
+| `cleanupImages.cellposeCorrect` | 2026-06-18 15:58 |
+| `cleanupImages.driftCorrect` | 2026-06-19 11:43 |
+| `importImages.remove` ×2 — intermediates deleted | 2026-06-19 12:09–12:10 |
+
+So the order was **denoise → drift correct**, and the raw + `ccidCpCorrected` intermediates were
+removed, leaving only the drift-corrected result. Settings used:
+
+```
+{'model': ['denoise_cyto3'], 'modelChannels': [0,1,2,3], 'modelDiameter': [10]}   # 4-channel
+{'model': ['denoise_cyto3'], 'modelChannels': [0,1,2],   'modelDiameter': [10]}   # 3-channel
+```
+
+`modelDiameter=10` is worth revisiting: cells measure ~15–20 px across, so denoise was told to
+expect objects about half their real size, which biases it toward preserving fine structure — i.e.
+the speckle we are trying to remove.
+
+**Consequence for every measurement in `docs/SEGMENTATION.md`:** the ~10% residual noise and the
+4518-blob prob map are what *survives* cellpose, not raw sensor noise. Any second denoise pass
+applied to `ccidDriftCorrected` (as measured below) is double-denoising.
+
+### Sources
+
+`.oir` originals live on the rclone Google Drive mount at
+`/home/dominik/gdrive/Notebook/DATA/TCELL_TYPES/{20211125,20211128}/`, ~1.03 GB each plus sidecar
+`_00001/`, `_00002/` chunk folders which hold the bulk of the pixels. The nine TRAIN/TEST movies map
+to `M{1,2,3}-{1,2,3}-B6-naive-gBT-uGFP-OTI-CTV-P14-ubTomato-z{230,250,280,300}*.oir`; the exact
+per-uid filename is in each image's `importImages.omezarr.*.log`, and also in the OME XML
+(`<zarr>/OME/METADATA.ome.xml`, `Name="....oir"`).
+
+### Why cellpose denoise is wrong for confetti
+
+Measured on `fFnZOv` (a second pass over already-denoised data, so read the direction not the
+magnitude): `denoise_cyto3` rescales per channel, per image to ~[0, 1] — background p25 6429 → 0.6,
+dynamic range 4635 → 0.5 — which destroys absolute intensity **and** the inter-channel ratios that
+carry confetti identity. Purity of the brightest 10% of pixels fell 0.700 → 0.660.
+
+So coastal's denoiser has a hard requirement cellpose does not meet: **preserve per-channel absolute
+intensity**, since colour identity is the ratio between channels.
+
+### Intensity-preserving alternatives, measured
+
+Middle frame of a 9-frame window, `fFnZOv` z=7. All preserve background within 2% (unlike cellpose):
+
+| method | bg preserved | bg noise sd | purity | dominant-colour agreement |
+|---|---|---|---|---|
+| raw (`ccidDriftCorrected`) | 100% | 385 | 0.703 | 100% |
+| spatial gaussian σ=1 | 100.8% | 218 (−43%) | 0.642 | 91.6% |
+| temporal mean, 3 frames | 100.9% | 293 (−24%) | 0.640 | 90.7% |
+| temporal mean, 5 frames | 101.3% | 238 (−38%) | 0.615 | 86.1% |
+| temporal mean, 9 frames | 101.7% | 200 (−48%) | 0.589 | 81.3% |
+| spatial median 3×3 | 100.3% | 377 (−2%) | 0.637 | 87.5% |
+
+Every option costs purity, and **plain temporal averaging gets worse the longer the window** —
+cells move enough between frames to smear across positions and mix colours. That is the argument for
+Part B's motion compensation: it is the only route that trades noise for √N without spatial mixing,
+and the Farneback fields are already computed in `flow.py`.
+
+Caveat on the purity column: it is evaluated at pixels chosen as brightest in the *raw* frame, which
+penalises any spatial redistribution, so those drops are an upper bound on the true cost. A per-cell
+purity measure would be fairer.
+
+### Next
+
+Dominik is re-processing from the `.oir` originals in cecelia feijoa with the order reversed —
+**drift correct first, denoise second** — keeping the intermediates this time. With raw +
+drift-corrected + denoised all available for one movie (`fFnZOv`, which every measurement in this
+session used), the denoiser can finally be tuned against a real before/after instead of a
+double-denoised proxy.

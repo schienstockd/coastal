@@ -149,6 +149,35 @@ labels across Z by sparse IOU overlap, then bridges chains broken by ≤ `gap_to
 (`_bridge_label_gaps`). `intersection_over_union` builds the sparse overlap matrix;
 `filter_small_cells(instances_4d, min_voxels)` drops sub-threshold labels per timepoint.
 
+### The foreground is speckle, and it is the real bottleneck
+
+The prob head resolves cells, but sits on a 1–3 px noise floor that also crosses
+`prob_threshold`. Measured on a real frame (T=180 prep): `prob > 0.4` gives **4518 blobs,
+median 3 px, 99% under 100 px** covering 21% of the frame, which region growing then carves into
+~1000 labels. This — not the inference parameters — is why ~86% of detections are fragments.
+
+Two fixes were measured:
+
+- **Raising `prob_threshold` does not work.** 0.4 → 0.9 drops fragments only 88% → 58% while
+  labels collapse 719 → 40: it discards real cells as fast as noise, because most cells' probability
+  overlaps the background texture. (`prob_threshold` is also commented out of `PARAM_NAMES`, so it
+  has never been tuned — but 0.4 is already the best of the values tested.)
+- **`prob_blur_sigma` (new, default 0.0 = off) does suppress the speckle.** Cells (~15–20 px) and
+  speckle (1–3 px) differ by scale, so a blur separates them where a threshold cannot: on the raw
+  mask, σ=3 cuts blobs 3612 → 142 and raises median size 3 → 64 px with the count of cell-sized
+  (≥100 px) blobs unchanged at ~57.
+
+  End-to-end it is a **trade, not a free win**: median label size 24 → 89 px and fragments 88% → 58%,
+  but coverage of the colour-carrying area falls 25% → 19% and the share of labels straddling two
+  colours rises 39% → 54%, so `score_label_size_confetti` nets ~7% *down*. Whether that trade is
+  worth it is a judgement about what tracking needs downstream.
+
+The number that frames all of this: **labels cover only ~25% of the colour-carrying area even at
+σ=0.** Three-quarters of the visible cell material is unlabelled, so coverage — not fragment
+cleanup — is the deficit to attack. That points at the training signal: the prob-head target is
+`0.5*bright + 0.3*local_contrast + 0.2*edge`, three grayscale texture statistics, with neither
+confetti (identity) nor flow (separation) connected to it.
+
 ## Known issues
 
 - **Y-cell splitting** — cells with a body + probing leading edge segment as two instances.

@@ -268,3 +268,72 @@ def test_merge_max_distance_bound_cannot_disable_merging():
     lo, hi = PARAM_BOUNDS['merge_max_distance']
     assert lo >= 1.0, f'lower bound {lo} lets the search disable merging'
     assert hi > lo
+
+
+# --------------------------------------------------------------------------- #
+# prob_blur_sigma: speckle suppression before thresholding                      #
+# --------------------------------------------------------------------------- #
+
+class _SpeckledUNet(torch.nn.Module):
+    """Cell-sized blobs sitting on a fine-grained noise floor, like the real prob head.
+
+    Measured on a real frame: `prob > 0.4` yields ~3600 blobs of median 3 px, because the
+    background texture crosses the threshold too. Cells (~15-20 px) and speckle (1-3 px)
+    differ by scale, which is what makes a blur separate them where a threshold cannot.
+    """
+    num_metrics = 14
+
+    def forward(self, x):
+        n, _, h, w = x.shape
+        g = torch.Generator().manual_seed(0)
+        prob = torch.where(torch.rand(n, 1, h, w, generator=g) < 0.25, 2.0, -6.0)  # speckle
+        for (y, x0) in ((6, 6), (6, 30), (30, 6), (30, 30)):
+            prob[:, :, y:y + 14, x0:x0 + 14] = 6.0                                  # cells
+        return prob, torch.ones(n, 4, h, w)
+
+
+def _speckle_seg(sigma):
+    return LearnedAffinityInference(
+        model=_SpeckledUNet(), device='cpu', prob_threshold=0.4, prob_blur_sigma=sigma,
+        seed_size=5, embedding_blur_sigma=0.5, min_component_size=2, min_boundary_pixels=1,
+        affinity_threshold=0.5, merge_affinity_threshold=0.9, merge_max_distance=0.0)
+
+
+def _n_foreground_blobs(seg, frame, metrics):
+    from scipy import ndimage
+    prob, _, _ = seg.predict_frame(frame, metrics)
+    return ndimage.label(prob > seg.prob_threshold)[1]
+
+
+def test_prob_blur_removes_speckle_but_keeps_the_cells():
+    from scipy import ndimage
+    frame = np.zeros((50, 50), dtype=np.float32)
+    frame[6:20, 6:20] = 1.0
+    metrics = {f'm{i}': np.zeros((50, 50), dtype=np.float32) for i in range(14)}
+
+    def blobs_and_cells(sigma):
+        seg = _speckle_seg(sigma)
+        prob, _, _ = seg.predict_frame(frame, metrics)
+        comp, n = ndimage.label(prob > 0.4)
+        sizes = np.bincount(comp.ravel())[1:]
+        return n, int((sizes >= 100).sum())
+
+    n_raw, cells_raw = blobs_and_cells(0.0)
+    n_blur, cells_blur = blobs_and_cells(2.0)
+
+    assert n_blur < n_raw / 3, f'blur must collapse the speckle ({n_raw} -> {n_blur})'
+    assert cells_blur >= cells_raw, 'the cell-sized blobs must survive'
+
+
+def test_prob_blur_defaults_to_off():
+    """Zero sigma must be an exact no-op, so existing results are unchanged."""
+    frame = np.zeros((40, 40), dtype=np.float32)
+    frame[5:15, 5:15] = 1.0
+    metrics = {f'm{i}': np.zeros((40, 40), dtype=np.float32) for i in range(14)}
+    a = _speckle_seg(0.0).predict_frame(frame, metrics)[0]
+    b = LearnedAffinityInference(
+        model=_SpeckledUNet(), device='cpu', prob_threshold=0.4,
+        seed_size=5, embedding_blur_sigma=0.5, min_component_size=2, min_boundary_pixels=1,
+        affinity_threshold=0.5, merge_affinity_threshold=0.9,
+        merge_max_distance=0.0).predict_frame(frame, metrics)[0]
+    np.testing.assert_array_equal(a, b)

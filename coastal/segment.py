@@ -122,6 +122,7 @@ class LearnedAffinityInference:
                  min_boundary_pixels=1,
                  prob_threshold=0.3,
                  embedding_blur_sigma=1.5,
+                 prob_blur_sigma=0.0,
                  max_iter=200,
                  min_component_size=20):
         """
@@ -209,6 +210,7 @@ class LearnedAffinityInference:
         # Optional tuning (4)
         self.prob_threshold = prob_threshold
         self.embedding_blur_sigma = embedding_blur_sigma
+        self.prob_blur_sigma = prob_blur_sigma
         self.max_iter = max_iter
         self.min_component_size = min_component_size
 
@@ -259,6 +261,16 @@ class LearnedAffinityInference:
             prob, embeddings = self.model(frame_and_metrics)
             prob_map = torch.sigmoid(prob)[0, 0].cpu().numpy()
             emb_np = embeddings[0].permute(1, 2, 0).cpu().numpy()
+
+        # Speckle suppression. The prob head resolves cells (~15-20 px blobs) but sits on a
+        # 1-3 px noise floor that also crosses prob_threshold, so the foreground mask comes
+        # out as ~3600 blobs of median 3 px per frame. Cells and speckle differ by scale, so
+        # a blur at cell scale separates them where a threshold cannot: measured on a real
+        # frame, sigma=3 cuts the blob count 3612 -> 142 and raises median size 3 -> 64 px
+        # while leaving the number of cell-sized (>=100 px) blobs unchanged at ~57.
+        # See docs/SEGMENTATION.md.
+        if self.prob_blur_sigma > 0:
+            prob_map = gaussian_filter(prob_map, sigma=self.prob_blur_sigma)
 
         H, W, D = emb_np.shape
 

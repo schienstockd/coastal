@@ -42,6 +42,12 @@ deferred**, **when to revisit**. Distinct from `docs/TODO.md` (active backlog) a
   (86.7% → 89.7% of real touching pairs merged), because only the coherence half gets trained
   and tighter within-cell coherence promotes growing and merging. Not a shortcut through the
   confetti input: the effect holds with the variance channels zero-filled.
+- **Do NOT try to fix this by training on synthetic crowding.** `crowdgen` superposes copies that
+  pass *through* each other: no deformation, no slowing, no avoidance. At a synthetic contact the
+  flow field is just two independent motions overlaid, so the interaction signature that would
+  actually let flow separate touching cells is absent. Training a flow-based boundary signal there
+  teaches a pattern that does not exist in real data. For the same reason `crowdgen` cannot
+  validate anything flow-dependent — use the real-contact benchmark.
 - **When to revisit:** as soon as genuinely crowded confetti data exists. That data is also the
   only source of the cell–cell avoidance behaviour that makes a boundary learnable from flow at
   all. Benchmark to use: the 465 real touching different-colour pairs mined from the confetti

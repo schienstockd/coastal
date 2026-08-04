@@ -229,8 +229,13 @@ time-offset copies of real AF+drift confetti superposed, per-cell GT; 2 movies �
    is exactly what two touching cells drifting as a pair have. Adjacent pixels straddling a contact
    are never presented as a negative. Fixing this is a training change, not an inference one.
 
-Caveat on the synthetic scenes: they reach only ~4% GT area coverage, well short of real crowding,
-so the absolute merge rates are optimistic.
+**`crowdgen` cannot validate anything flow-dependent.** Superposed copies pass *through* each
+other — no deformation, no slowing, no avoidance — so at a synthetic contact the flow field is
+merely two independent motions overlaid. The interaction signature that would let flow separate
+touching cells is absent by construction. Use it for target-shape comparisons (the blur ranking
+below is one, scored on identical scenes) and never for judging separation. The scenes also reach
+only ~4% GT area coverage, so absolute merge rates from them are optimistic — measured against
+real contacts, by about 3x.
 
 ### A real validation set: touching cells of different colour
 

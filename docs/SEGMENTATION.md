@@ -229,8 +229,16 @@ time-offset copies of real AF+drift confetti superposed, per-cell GT; 2 movies �
    is exactly what two touching cells drifting as a pair have. Adjacent pixels straddling a contact
    are never presented as a negative. Fixing this is a training change, not an inference one.
 
-Caveat: the synthetic scenes reach only ~4% GT area coverage, well short of mem-TOM crowding, so
-every merge rate above is optimistic.
+Two caveats on the synthetic scenes, both making the numbers optimistic. They reach only ~4% GT
+area coverage, well short of mem-TOM crowding. And because they superpose *time-offset copies of
+the same movie*, every pair of touching cells moves independently **by construction** — measured,
+100% of adjacent different-colour pairs have relative motion above what Farneback resolves, and
+68% above the within-cell flow noise floor (1.35 px/frame). Real touching T cells in a crowded
+node may co-move far more often, and a co-moving contact is invisible in greyscale + flow: colour
+is the only cue that separates it, and colour is not available at inference. So this data cannot
+tell us how much of the problem is learnable on real crowding — only that on *these* scenes the
+motion signal is present and the model is not using it (pairs it merges still move 1.70 px/frame
+apart, against 2.51 for pairs it keeps separate).
 
 ## Known issues
 

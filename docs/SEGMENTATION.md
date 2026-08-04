@@ -277,6 +277,51 @@ satellites), median colour purity of the weaker member 1.00 (nowhere near the 1/
 noise-flipped dominant channel would sit), 0% excluded by either filter, and six examples plotted
 and eyeballed. The 86.7% is unchanged under every filter.
 
+### `ConfettiBoundaryLoss`: right mechanism, not enough data (2026-08-04)
+
+Built to close exactly the gap above — push embeddings apart across a confetti-colour boundary,
+pull them together within one colour, mining contacts explicitly rather than sampling windows and
+hoping. Shipped **off by default** (`boundary_weight=0.0`). It made segmentation *worse*, and the
+reason is worth recording because it is a data limit, not a design flaw.
+
+Trained 80 epochs alongside the confetti p99 loss (blur 1.0); the term converged 0.199 → 0.008.
+Scored on the 465 real pairs:
+
+| | merged | correctly separated |
+|---|---|---|
+| baseline (confetti blur 1.0) | 86.7% | 13.3% |
+| + boundary loss | **89.7%** | 10.3% |
+
+The embedding measurement explains it. Under the real inference condition (variance channels
+zero-filled) the boundary model **did** improve separation, d 0.22 → 0.40 — and this is *not* a
+shortcut through the confetti input channels: supplying them changes d only 0.40 → 0.44. But the
+gain is entirely in the wrong half:
+
+| | within cell | different colour |
+|---|---|---|
+| baseline | 0.945 | 0.920 |
+| + boundary loss | **0.965** | 0.926 |
+
+Within-cell coherence tightened; different-colour cosine moved the *wrong way*. Tighter
+within-cell coherence is precisely what lets region growing expand further and raises
+`_compute_fragment_affinity`, so merging went up.
+
+The negative half of the loss is starved. Counted over 42 real training frames exactly as
+`forward` mines them:
+
+| | |
+|---|---|
+| positive pairs (same colour, adjacent) | 112,256 |
+| **negative pairs (different colour, adjacent)** | **123** |
+| ratio | 913 : 1 |
+| frames containing *any* negative pair | 11/42 (26%) |
+
+For three-quarters of training steps the term carries no boundary signal at all and acts purely as
+a coherence loss. **The sparse confetti movies contain ~0.1% of the signal this loss needs.** The
+mechanism is sound and ready; genuinely crowded confetti data is the prerequisite, and it is also
+the only data containing the cell–cell avoidance behaviour that would make the flow signature
+learnable in the first place. Revisit when the crowded confetti mice are available.
+
 ## Known issues
 
 - **Y-cell splitting** — cells with a body + probing leading edge segment as two instances.

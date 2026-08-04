@@ -31,3 +31,19 @@ deferred**, **when to revisit**. Distinct from `docs/TODO.md` (active backlog) a
   67% are within-frame cost-matrix errors that a global formulation doesn't fix on its own.
 - **When to revisit:** after the per-frame cost matrix is improved (Phase B), to mop up the
   at-gap residual — pair it with a better colour/motion cost, not as a standalone fix.
+
+## `ConfettiBoundaryLoss` — blocked on crowded confetti data
+- **What:** a contrastive term that pushes embeddings apart across a confetti-colour boundary
+  and pulls them together within one colour, to stop touching cells merging. Implemented,
+  tested, and shipped **off by default** (`train_with_metrics(boundary_weight=0.0)`).
+- **Why deferred:** the sparse movies contain almost none of the signal it needs — 123 negative
+  (different-colour adjacent) pairs against 112,256 positives over 42 training frames, 913:1,
+  with 74% of frames containing no negative at all. Trained anyway it makes segmentation worse
+  (86.7% → 89.7% of real touching pairs merged), because only the coherence half gets trained
+  and tighter within-cell coherence promotes growing and merging. Not a shortcut through the
+  confetti input: the effect holds with the variance channels zero-filled.
+- **When to revisit:** as soon as genuinely crowded confetti data exists. That data is also the
+  only source of the cell–cell avoidance behaviour that makes a boundary learnable from flow at
+  all. Benchmark to use: the 465 real touching different-colour pairs mined from the confetti
+  movies (colour as free ground truth, never seen by the model) — baseline 86.7% merged, hard
+  floor ~22.6% set by co-moving pairs. Full measurements in `docs/SEGMENTATION.md`.

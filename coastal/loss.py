@@ -114,6 +114,132 @@ class ConfettiForegroundLoss(nn.Module):
         return F.binary_cross_entropy_with_logits(pred_prob.float(), target)
 
 
+class ConfettiBoundaryLoss(nn.Module):
+    """Push embeddings apart across a confetti-colour boundary; pull them together within a colour.
+
+    Measured motivation. Segmentation merges **86.7% of real touching different-colour cell
+    pairs** (465 pairs mined from all 9 confetti movies, colour as ground truth). The
+    embeddings are the reason: cosine across a different-colour contact is 0.920 against
+    0.945 within a single cell — Cohen's d = 0.22, i.e. a cell boundary is nearly
+    indistinguishable from cell interior. Nothing downstream can recover that; see
+    docs/SEGMENTATION.md.
+
+    Why the existing terms do not supply it:
+
+    - ``VarianceMetricsLoss`` is negatives-only and mines the k pixels *farthest* in metric
+      space within a window — cells that are already far apart, the easy case. Two pixels
+      straddling a contact are never presented as a negative.
+    - ``TemporalMetricsLoss`` *pulls together* pixels with similar motion, which is exactly
+      what two touching cells drifting as a pair have. It actively fuses them.
+
+    So this term mines the contacts **explicitly** rather than sampling and hoping. That
+    matters because contacts are rare: the training movies are sparse, and a random window
+    almost never contains one. Explicit mining is what makes the signal usable at this
+    density — but it cannot manufacture events that are not there, so genuinely crowded
+    confetti data remains the real fix.
+
+    A pixel pair at offset ``offsets`` is a **negative** when the two pixels' dominant
+    confetti channels differ and both are confidently coloured, and a **positive** when they
+    agree. Negatives get a hinge on cosine similarity; positives a symmetric pull, so the
+    term cannot be minimised by simply scattering every embedding.
+
+    Confetti is used to build the *pairing*, never as model input — identical in kind to
+    ``ConfettiForegroundLoss``. At inference the variance channels are zero-filled and the
+    network must predict boundaries from greyscale + flow alone. That caps what this can
+    achieve: ~24% of real contacts are co-moving, and for those nothing in the input
+    distinguishes the contact from cell interior. The other ~76% have resolvable relative
+    motion (median 2.10 px/frame against a 1.28 px/frame within-cell noise floor).
+    """
+
+    def __init__(self, margin: float = 0.5, min_confidence: float = 0.5,
+                 offsets: tuple = (2, 4), pos_weight: float = 0.3,
+                 max_pairs: int = 4096):
+        super().__init__()
+        self.margin = margin
+        self.min_confidence = min_confidence
+        self.offsets = offsets
+        self.pos_weight = pos_weight
+        self.max_pairs = max_pairs
+
+    @staticmethod
+    def _colour(m, device):
+        """(dominant channel, confidence) from the softmax_ch_* metrics, or None."""
+        keys = sorted(k for k in m.keys() if k.startswith('softmax_ch_'))
+        if len(keys) < 2:
+            return None, None
+        stack = torch.stack([
+            (v if isinstance(v, torch.Tensor) else torch.from_numpy(v)).to(device).float()
+            for v in (m[k] for k in keys)
+        ], dim=0)                                        # [C, H, W]
+        total = stack.sum(dim=0) + 1e-6
+        conf, dom = (stack / total).max(dim=0)           # share held by the winner
+        # Scale by brightness so background — where one channel "wins" on noise alone — is
+        # never confidently coloured. Percentile, not max, for the same reason as
+        # ConfettiForegroundLoss: one bright cell must not set the scale.
+        bright = stack.sum(dim=0)
+        hi = torch.quantile(bright.flatten().float(), 0.99) + 1e-6
+        return dom, conf * torch.clamp(bright / hi, 0, 1)
+
+    def forward(self, metric_emb, variance_metrics):
+        """
+        Args:
+            metric_emb:        [B, D, H, W] embeddings
+            variance_metrics:  list of B dicts with `softmax_ch_*` [H, W] arrays
+        Returns:
+            Scalar loss, or 0.0 when no confetti metrics are supplied (so it is a no-op at
+            inference and on grayscale-only training data).
+        """
+        if not variance_metrics:
+            return torch.zeros((), device=metric_emb.device, dtype=torch.float32)
+
+        device = metric_emb.device
+        emb = F.normalize(metric_emb.float(), dim=1, p=2)
+        B = emb.shape[0]
+        losses = []
+
+        for b in range(B):
+            m = variance_metrics[b] if isinstance(variance_metrics, list) else variance_metrics
+            dom, conf = self._colour(m, device)
+            if dom is None:
+                continue
+            valid = conf > self.min_confidence
+            e = emb[b]                                   # [D, H, W]
+
+            for off in self.offsets:
+                # Compare each pixel with the one `off` away, along each axis in turn. A colour
+                # boundary shows up as a pair that is close in space but different in colour.
+                for axis in (0, 1):
+                    lo = (slice(off, None), slice(None)) if axis == 0 else \
+                         (slice(None), slice(off, None))
+                    hi = (slice(None, -off), slice(None)) if axis == 0 else \
+                         (slice(None), slice(None, -off))
+                    a, b_ = e[(slice(None),) + lo], e[(slice(None),) + hi]
+                    if a.numel() == 0:
+                        continue
+                    d1, d2 = dom[lo], dom[hi]
+                    both = valid[lo] & valid[hi]
+                    if not both.any():
+                        continue
+                    sim = (a * b_).sum(dim=0)            # cosine, embeddings are unit norm
+                    diff = both & (d1 != d2)             # across a colour boundary
+                    same = both & (d1 == d2)             # within one colour
+
+                    if diff.any():
+                        s = sim[diff]
+                        if s.numel() > self.max_pairs:
+                            s = s[torch.randperm(s.numel(), device=device)[:self.max_pairs]]
+                        losses.append(torch.clamp(self.margin + s, min=0.0).mean())
+                    if same.any() and self.pos_weight > 0:
+                        s = sim[same]
+                        if s.numel() > self.max_pairs:
+                            s = s[torch.randperm(s.numel(), device=device)[:self.max_pairs]]
+                        losses.append(self.pos_weight * (1.0 - s).mean())
+
+        if not losses:
+            return torch.zeros((), device=device, dtype=torch.float32)
+        return torch.stack(losses).mean()
+
+
 class IntensityLoss(nn.Module):
     """Probability guidance using intensity + contrast + edges.
 

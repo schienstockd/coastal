@@ -6,7 +6,8 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 
 from coastal.model import UNetWithEmbeddings
-from coastal.loss import ConfettiForegroundLoss, IntensityLoss, TemporalMetricsLoss, VarianceMetricsLoss, WarpConsistencyLoss
+from coastal.loss import (ConfettiBoundaryLoss, ConfettiForegroundLoss, IntensityLoss,
+                          TemporalMetricsLoss, VarianceMetricsLoss, WarpConsistencyLoss)
 from coastal.device import resolve_device
 
 
@@ -200,6 +201,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                        num_epochs=50, batch_size=1, seed=42, device=None, embedding_dim=16,
                        variance_weight=1.0, intensity_weight=1.0, temporal_weight=2.0,
                        warp_weight=0.0, confetti_weight=0.0, confetti_blur_sigma=1.0,
+                       boundary_weight=0.0,
                        flow_pairs=None,
                        max_grad_norm=1.0, variance_window_size=32, variance_dropout_p=0.5,
                        num_workers=4, use_amp=True):
@@ -228,6 +230,12 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                           dial rather than a separation knob — 1.0 wins on F1 and roughly
                           halves merges vs 2.0, but sharpening further shatters cells. See
                           the table in loss.ConfettiForegroundLoss.
+        boundary_weight:  weight for ConfettiBoundaryLoss (default 0.0 = off). Pushes
+                          embeddings apart across a confetti-colour boundary, which is the
+                          one thing no other term supplies: measured on real touching cells,
+                          embedding cosine across a different-colour contact is 0.920 against
+                          0.945 within a cell, and segmentation merges 86.7% of such pairs.
+                          Needs variance_metrics_norm. See docs/SEGMENTATION.md.
         temporal_weight: weight for TemporalMetricsLoss (default 2.0)
         max_grad_norm: gradient clipping threshold (default 1.0)
         variance_window_size: spatial window size for windowed variance contrastive loss (default 32)
@@ -253,13 +261,15 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     # optimised (the header used to omit the confetti term entirely).
     active = [n for n, w in (('INTENSITY', intensity_weight), ('TEMPORAL', temporal_weight),
                              ('VARIANCE', variance_weight), ('WARP', warp_weight),
-                             ('CONFETTI', confetti_weight)) if w > 0]
+                             ('CONFETTI', confetti_weight),
+                             ('BOUNDARY', boundary_weight)) if w > 0]
     n_losses = len(active)
     print(f"TRAINING: {' + '.join(active)} ({n_losses}-LOSS)")
     print(f"Loss: Intensity ({intensity_weight}) + Temporal ({temporal_weight}) + "
           f"Variance ({variance_weight}, window={variance_window_size}px, "
           f"dropout_p={variance_dropout_p}) + Warp ({warp_weight}) + "
-          f"Confetti ({confetti_weight}, blur={confetti_blur_sigma}px)")
+          f"Confetti ({confetti_weight}, blur={confetti_blur_sigma}px) + "
+          f"Boundary ({boundary_weight})")
     print(f"Gradient clipping: {max_grad_norm} | AMP: {use_amp} | Workers: {num_workers}")
     print(f"{'='*80}\n")
 
@@ -314,6 +324,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     loss_intensity = IntensityLoss().to(device)
     loss_confetti = ConfettiForegroundLoss(blur_sigma=confetti_blur_sigma).to(device) \
         if confetti_weight > 0.0 else None
+    loss_boundary = ConfettiBoundaryLoss().to(device) if boundary_weight > 0.0 else None
     loss_temporal = TemporalMetricsLoss().to(device)
     loss_variance = VarianceMetricsLoss(window_size=variance_window_size).to(device)
     loss_warp = WarpConsistencyLoss().to(device) if warp_weight > 0.0 else None
@@ -328,6 +339,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
         'temporal': [],
         'warp': [],
         'confetti': [],
+        'boundary': [],
     }
 
     for epoch in range(num_epochs):
@@ -339,6 +351,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             'temporal': 0.0,
             'warp': 0.0,
             'confetti': 0.0,
+            'boundary': 0.0,
         }
 
         for batch_idx, batch in enumerate(dataloader):
@@ -369,6 +382,8 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                 l_intensity = loss_intensity(pred_prob, channels)
                 l_confetti = loss_confetti(pred_prob, v_metrics) if loss_confetti is not None \
                     else torch.tensor(0.0, device=device)
+                l_boundary = loss_boundary(metric_emb, v_metrics) \
+                    if loss_boundary is not None else torch.tensor(0.0, device=device)
                 l_temporal = loss_temporal(metric_emb, t_metrics)
                 l_variance = loss_variance(metric_emb, v_metrics, frame_indices=frame_indices) if use_variance else \
                     torch.tensor(0.0, device=device)
@@ -390,7 +405,8 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                              temporal_weight * l_temporal +
                              variance_weight * l_variance +
                              warp_weight * l_warp +
-                             confetti_weight * l_confetti)
+                             confetti_weight * l_confetti +
+                             boundary_weight * l_boundary)
 
             optimizer.zero_grad()
             scaler.scale(total_loss).backward()
@@ -408,6 +424,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             epoch_losses['temporal'] += l_temporal.item()
             epoch_losses['warp'] += l_warp.item()
             epoch_losses['confetti'] += l_confetti.item()
+            epoch_losses['boundary'] += l_boundary.item()
 
         n = len(dataloader)
         for key in epoch_losses:
@@ -417,12 +434,13 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
         if (epoch + 1) % 10 == 0 or epoch == 0:
             warp_str = f" | warp={epoch_losses['warp']:.4f}" if warp_weight > 0 else ""
             conf_str = f" | conf={epoch_losses['confetti']:.4f}" if confetti_weight > 0 else ""
+            bnd_str = f" | bnd={epoch_losses['boundary']:.4f}" if boundary_weight > 0 else ""
             print(f"Epoch {epoch+1:3d}/{num_epochs}: "
                   f"total={epoch_losses['total']:.4f} | "
                   f"int={epoch_losses['intensity']:.4f} | "
                   f"tmp={epoch_losses['temporal']:.4f} | "
                   f"var={epoch_losses['variance']:.4f}"
-                  + warp_str + conf_str)
+                  + warp_str + conf_str + bnd_str)
 
     print(f"\nFinal losses:")
     print(f"  Total:     {history['total'][-1]:.4f}")

@@ -229,16 +229,53 @@ time-offset copies of real AF+drift confetti superposed, per-cell GT; 2 movies �
    is exactly what two touching cells drifting as a pair have. Adjacent pixels straddling a contact
    are never presented as a negative. Fixing this is a training change, not an inference one.
 
-Two caveats on the synthetic scenes, both making the numbers optimistic. They reach only ~4% GT
-area coverage, well short of mem-TOM crowding. And because they superpose *time-offset copies of
-the same movie*, every pair of touching cells moves independently **by construction** — measured,
-100% of adjacent different-colour pairs have relative motion above what Farneback resolves, and
-68% above the within-cell flow noise floor (1.35 px/frame). Real touching T cells in a crowded
-node may co-move far more often, and a co-moving contact is invisible in greyscale + flow: colour
-is the only cue that separates it, and colour is not available at inference. So this data cannot
-tell us how much of the problem is learnable on real crowding — only that on *these* scenes the
-motion signal is present and the model is not using it (pairs it merges still move 1.70 px/frame
-apart, against 2.51 for pairs it keeps separate).
+Caveat on the synthetic scenes: they reach only ~4% GT area coverage, well short of real crowding,
+so the absolute merge rates are optimistic.
+
+### A real validation set: touching cells of different colour
+
+The synthetic scenes superpose *time-offset copies of the same movie*, so every touching pair
+moves independently by construction, which looked like it would overstate how separable real
+contacts are. It does not — checked directly, and the concern was backwards.
+
+Wherever two differently-coloured cells genuinely touch in the confetti movies, **colour is free
+ground truth and the model never sees it** (the 3 variance channels are zero-filled at inference).
+Mining all 9 movies across every valid z-plane and three 20-frame windows yields **465 real
+touching different-colour pairs** over 431 frames — real cells, real scanner, no synthesis and no
+domain gap. (mem-TOM is not usable for this: different cells *and* a different microscope.)
+
+|  | relative motion above the flow noise floor | co-moving |
+|---|---|---|
+| synthetic (`crowdgen`) | 68% | 32% |
+| **real confetti pairs** | **75.7%** | **24.3%** |
+
+Real touching cells move apart *more* than the synthetic copies do (median 2.10 px/frame against a
+1.28 px/frame within-cell noise floor). This sets the ceiling on any flow-only boundary signal:
+about **76% of real contacts are in principle separable**, and the remaining ~24% are co-moving,
+where nothing in greyscale + flow distinguishes the contact from cell interior — colour is the only
+cue and it is unavailable at inference. Confetti can supervise which *flow* patterns mean
+"boundary"; it cannot smuggle colour into inference.
+
+Scored on that set, the current model (confetti p99, blur 1.0, `prob_threshold=0.40`) **merges
+86.7% of real touching different-colour pairs**:
+
+| of all 465 real contacts | |
+|---|---|
+| correctly separated | 13.3% |
+| **merged, but the motion IS resolvable** | **64.1%** ← recoverable |
+| merged and co-moving | 22.6% ← hard floor |
+
+Take that seriously against the synthetic numbers above, which put merges at 2.4% of predicted
+labels (32.8% of adjacent GT pairs). The definitions differ — synthetic pairs are whole GT cells,
+real pairs are thresholded colour components — but the gap is far too large to be definitional.
+Real cells in contact interdigitate in a way randomly-pasted copies do not, so **the synthetic
+scenes badly understate the merge problem** and should not be used to judge it.
+
+The mined pairs were validated before drawing that conclusion, since an aggregate number is exactly
+what hid the earlier broken GT: median size ratio between the two components 0.67 (no rim
+satellites), median colour purity of the weaker member 1.00 (nowhere near the 1/3 tie point where a
+noise-flipped dominant channel would sit), 0% excluded by either filter, and six examples plotted
+and eyeballed. The 86.7% is unchanged under every filter.
 
 ## Known issues
 

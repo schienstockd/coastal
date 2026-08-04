@@ -20,6 +20,13 @@ Public API
 ----------
 - ``DenoiseModel(model_type=..., device=...)`` — holds the loaded net; reuse across planes.
 - ``denoise_image(arr, ...)`` — one-shot convenience wrapper.
+- ``denoise_preserving_ratio(arr, channels=...)`` — multi-channel denoising that leaves the ratios
+  between channels intact. Use this, not per-channel ``denoise_image``, on confetti data: identity
+  is the ratio, and restoring channels independently destroys it. **Needs no Cellpose weights** —
+  it defaults to a Gaussian restorer, which measurement puts within 0.7pp of the net.
+- ``ratio_preserving_gain(arr, restored, ...)`` — the array algebra behind it, model-free.
+- ``gaussian_restorer(sigma=...)`` / ``temporal_mean_restorer(window=...)`` /
+  ``cellpose_restorer(...)`` — pluggable projection restorers. For movies the temporal wins.
 
 Input is grayscale: a 2-D ``(Y, X)`` plane or a stack of planes ``(Z, Y, X)`` / ``(T, Y, X)``
 (each plane normalized and restored independently — matching how cecelia's cleanup task feeds
@@ -35,6 +42,7 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.ndimage import gaussian_filter, uniform_filter1d
 
 from coastal.device import resolve_device
 
@@ -397,3 +405,176 @@ def denoise_image(arr, model="denoise_cyto3", diameter=None, device=None, normal
     """One-shot restoration. See :class:`DenoiseModel`. ``arr`` is ``(Y,X)`` or ``(Z,Y,X)``."""
     return DenoiseModel(model_type=model, device=device).eval(
         arr, diameter=diameter, normalize=normalize, batch_size=batch_size, autocast=autocast)
+
+
+# ================================ ratio-preserving restoration =================================
+#
+# Confetti identity is the RATIO between channels, so restoring each channel independently is the
+# one thing a confetti pipeline must not do: three channels get three different NONLINEAR
+# corrections, and the ratio they encode is gone. Per-channel restoration agrees with the raw
+# dominant channel on only ~78% of cell PIXELS, and no un-mapping recovers it (normalising all
+# channels through one shared window instead of per-plane reaches ~81% — the wrapper was never the
+# problem).
+#
+# Restoring the PROJECTION once and applying it back as a per-pixel SCALAR gain sidesteps this: a
+# scalar cancels in a ratio, so identity is preserved by construction, and the segmentation path
+# still receives the denoised projection it consumes anyway.
+#
+# Scope of "by construction": exact PER PIXEL. Colour integrated over a cell MASK is a gain-
+# weighted mean, and channels are not distributed identically inside a mask, so it shifts a little
+# — measured 99.8% dominant-channel agreement over 1916 segmented cells, against 95.1% for
+# per-channel restoration. Absolute intensity is NOT preserved either way (the gain is what
+# changes it); anything measuring absolute brightness should read the raw store.
+#
+# See docs/todo/DENOISE_PLAN.md -> "Why cellpose denoise is wrong for confetti".
+
+# Ceiling on restored/raw. It binds on ~0.5% of pixels — those where the projection sits at the
+# noise floor, so the ratio runs away (measured p99.9 = 1.8e4, max 2.6e4 over 6 conditions). Not a
+# tuning knob: swept 1.0 -> 4.0 on 3 movies x 2 z-planes, seed recall is flat (~89% at prob 0.6)
+# at every value, and everything >= 1.3 is numerically indistinguishable. What a LOW cap costs is
+# speckle — blob count rises 142 (cap 1.3+) -> 298 (cap 1.0) at equal recall, because clamping the
+# gain to 1 leaves the noise floor un-suppressed.
+GAIN_CAP = 4.0
+_GAIN_FLOOR = 1e-3  # divisor floor, for pixels that are exactly zero.
+
+
+def ratio_preserving_gain(arr, restored, channels=None, channel_axis=0, cap=GAIN_CAP):
+    """Apply a restored projection back to a multi-channel image as a per-pixel scalar gain.
+
+    Pure array algebra — no model, no weights. Split out from :func:`denoise_preserving_ratio` so
+    the property that matters (channel ratios survive) is testable on its own, and so ``restored``
+    can come from anything.
+
+    That second point is not hypothetical. Ablating the restorer on 4 movies x 2 z-planes (prob
+    0.6, recall against raw-grey seeds) puts most of the win in "smooth the projection" rather
+    than in the net: raw 84.5% recall / 596 blobs, ``gaussian_filter(proj, 1)`` 87.5% / 158,
+    ``denoise_cyto3`` 88.2% / 138. The net earns +0.7pp and ~13% fewer blobs over a free gaussian
+    — real, but small enough that a caller without weights should reach for a gaussian, not go
+    without.
+
+    Args:
+        arr:          multi-channel image, e.g. ``(C, Y, X)`` or ``(T, C, Y, X)``.
+        restored:     the restored projection, shaped like ``arr`` with the channel axis dropped.
+        channels:     which channels carry the signal being restored (default: all). Channels
+                      outside this list are passed through untouched — e.g. a second-harmonic
+                      channel that is not part of the confetti ratio.
+        channel_axis: axis of ``arr`` holding channels.
+        cap:          ceiling on the gain. See :data:`GAIN_CAP`.
+
+    Returns:
+        float32 array shaped like ``arr``. Within ``channels``, every pixel is the input scaled by
+        one shared factor, so ``out[i] / out[j] == arr[i] / arr[j]`` everywhere the gain is
+        non-zero — including where ``cap`` binds, since clipping changes the shared factor, not the
+        ratio. What ``cap`` does cost is projection fidelity: ``out.mean(channels)`` equals
+        ``restored`` only where the cap is slack.
+    """
+    a = np.moveaxis(np.asarray(arr, dtype=np.float32), channel_axis, 0)
+    sel = list(range(a.shape[0])) if channels is None else list(channels)
+    if not sel:
+        raise ValueError("channels must select at least one channel")
+    proj = a[sel].mean(axis=0)
+    restored = np.asarray(restored, dtype=np.float32)
+    if restored.shape != proj.shape:
+        raise ValueError(f"restored {restored.shape} does not match the projection {proj.shape}")
+    gain = np.clip(restored / np.maximum(proj, _GAIN_FLOOR), 0.0, cap)
+    out = a.copy()
+    out[sel] = a[sel] * gain
+    return np.moveaxis(out, 0, channel_axis)
+
+
+def gaussian_restorer(sigma=1.0):
+    """Spatial restorer: a plane-wise Gaussian. No weights, no download, no net. The default,
+    because it is the only one valid for *any* input shape — see ``temporal_mean_restorer`` for
+    what to use when the leading axis really is time.
+
+    Chosen on measurement, not on principle. Ablating restorers inside the gain wrapper (4 movies
+    x 2 z-planes, recall against raw-grey seeds): raw 84.5% recall / 596 blobs, ``sigma=1``
+    87.5% / 158, ``denoise_cyto3`` 88.2% / 138. The Cellpose net wins by 0.7pp — not enough to
+    make a weights download and a vendored CPnet the default path for confetti data, which is
+    what this whole exercise was trying to get away from.
+    """
+    def restore(proj):
+        sig = (0,) * (proj.ndim - 2) + (sigma, sigma)
+        return gaussian_filter(proj, sigma=sig)
+    return restore
+
+
+def temporal_mean_restorer(window=3):
+    """Temporal restorer: a running mean along axis 0. **The best measured option for movies.**
+
+    Requires the leading axis of the projection to be TIME. Not the default only because
+    :func:`denoise_preserving_ratio` also accepts single timepoints, where this is meaningless.
+
+    At matched foreground area (4 movies x 2 z-planes x 3 frames) it beats every spatial option:
+    raw 83.9% recall at 3% area, ``gaussian_restorer(1)`` 89.3%, ``temporal_mean_restorer(3)``
+    **92.3%**. Wrapped in the gain, identity stays at 99.5% against 97.6% for averaging the
+    channels directly — the same segmentation, 1.9pp more identity, for free.
+
+    Note the window is small on purpose. Motion-compensating the frames first (warping them into
+    alignment before averaging) scores *worse* here, not better — 87.4% at 3% area — because this
+    segmenter is flow-supervised, and alignment deletes the inter-frame motion the UNet is
+    conditioned on. See docs/todo/DENOISE_PLAN.md -> B2.
+    """
+    def restore(proj):
+        if proj.ndim < 3:
+            raise ValueError("temporal_mean_restorer needs a time axis; got a single plane")
+        return uniform_filter1d(proj.astype(np.float32), size=window, axis=0, mode="nearest")
+    return restore
+
+
+def cellpose_restorer(model="denoise_cyto3", device=None, diameter=None, batch_size=8,
+                      autocast=False, _model=None):
+    """Opt-in Cellpose-3 restoration as the projection restorer.
+
+    Worth the extra 0.7pp only when that margin matters; :func:`gaussian_restorer` is the default.
+    ``denoise_cyto2`` scores within noise of ``cyto3``; ``denoise_nuclei`` fails outright on cell
+    data, flooding 60% of the frame with foreground.
+    """
+    net = _model if _model is not None else DenoiseModel(model_type=model, device=device)
+
+    def restore(proj):
+        flat = proj.reshape(-1, *proj.shape[-2:])
+        out = np.empty_like(flat)
+        for i, plane in enumerate(flat):
+            lo, hi = np.percentile(plane, 1), np.percentile(plane, 99)
+            if hi <= lo:                            # flat plane (e.g. drift padding)
+                out[i] = plane
+                continue
+            # normalize99 is (X - p1) / (p99 - p1) — a known affine, so undoing it on the output
+            # is exact and lands the result back in the input's units, where the gain is ~1.
+            r = net.eval(plane, diameter=diameter, normalize=True,
+                         batch_size=batch_size, autocast=autocast)
+            out[i] = r * (hi - lo) + lo
+        return out.reshape(proj.shape)
+    return restore
+
+
+def denoise_preserving_ratio(arr, channels=None, channel_axis=0, restorer=None, cap=GAIN_CAP):
+    """Denoise a multi-channel image without disturbing the ratios between its channels.
+
+    The mean projection over ``channels`` is restored plane by plane, then applied back to every
+    selected channel as a per-pixel scalar via :func:`ratio_preserving_gain` — so the ratio that
+    carries confetti identity comes through untouched.
+
+    Args:
+        arr:          ``(C, Y, X)`` or ``(T, C, Y, X)`` — any leading axes before the channel axis.
+        channels:     which channels to denoise (default all); others pass through untouched.
+        channel_axis: axis of ``arr`` holding channels.
+        restorer:     ``projection -> restored projection``, same shape. Gets the WHOLE projection
+                      (not one plane at a time) so temporal restorers can see the time axis.
+                      Defaults to :func:`gaussian_restorer`. **For movies, prefer
+                      ``temporal_mean_restorer(3)``** — measurably better and the leading axis is
+                      time. :func:`cellpose_restorer` is available but earns little.
+        cap:          see :data:`GAIN_CAP`.
+
+    Returns float32 in the input's intensity units.
+    """
+    a = np.moveaxis(np.asarray(arr, dtype=np.float32), channel_axis, 0)
+    sel = list(range(a.shape[0])) if channels is None else list(channels)
+    proj = a[sel].mean(axis=0)                      # (…, Y, X)
+
+    restore = restorer if restorer is not None else gaussian_restorer()
+    restored = np.asarray(restore(proj), dtype=np.float32)
+
+    return ratio_preserving_gain(arr, restored, channels=channels,
+                                 channel_axis=channel_axis, cap=cap)

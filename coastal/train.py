@@ -199,7 +199,7 @@ def train_test_split_per_movie(all_frames, all_metrics, train_ratio=0.8, shuffle
 def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm=None,
                        num_epochs=50, batch_size=1, seed=42, device=None, embedding_dim=16,
                        variance_weight=1.0, intensity_weight=1.0, temporal_weight=2.0,
-                       warp_weight=0.0, confetti_weight=0.0, confetti_blur_sigma=2.0,
+                       warp_weight=0.0, confetti_weight=0.0, confetti_blur_sigma=1.0,
                        flow_pairs=None,
                        max_grad_norm=1.0, variance_window_size=32, variance_dropout_p=0.5,
                        num_workers=4, use_amp=True):
@@ -224,7 +224,10 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                           the prob head with "one confetti colour dominates here, brightly",
                           blurred to cell scale, instead of grayscale texture. Needs
                           variance_metrics_norm. See docs/SEGMENTATION.md.
-        confetti_blur_sigma: cell-scale blur for that target (default 2.0 px)
+        confetti_blur_sigma: cell-scale blur for that target (default 1.0 px). A merge↔split
+                          dial rather than a separation knob — 1.0 wins on F1 and roughly
+                          halves merges vs 2.0, but sharpening further shatters cells. See
+                          the table in loss.ConfettiForegroundLoss.
         temporal_weight: weight for TemporalMetricsLoss (default 2.0)
         max_grad_norm: gradient clipping threshold (default 1.0)
         variance_window_size: spatial window size for windowed variance contrastive loss (default 32)

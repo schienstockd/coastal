@@ -172,11 +172,65 @@ Two fixes were measured:
   colours rises 39% → 54%, so `score_label_size_confetti` nets ~7% *down*. Whether that trade is
   worth it is a judgement about what tracking needs downstream.
 
+  **Compare it at matched foreground area, not at matched threshold** (re-measured 2026-08-01 on
+  the clean re-import, 4 movies × 2 z-planes × 3 frames). A blur lowers every prob value, so a
+  fixed threshold silently runs it at a stricter operating point and flatters or damns it
+  arbitrarily. At equal area σ=1 beats σ=0 outright — 70.5% vs 68.1% recall at 1% foreground with
+  half the blobs (47 vs 104); σ=3 trades the low-area end (60.9%) for the high (90.7% vs 87.8% at
+  5% area) with 16× fewer blobs.
+
+- **Cleaning the INPUT beats cleaning the prob map, and the two compose.** Restoring the mean
+  projection and applying it back as a per-pixel scalar gain
+  (`denoise.denoise_preserving_ratio`) gives 75.9% recall at 1% foreground area vs raw's 68.1%,
+  with 63 blobs vs 104 — and adding σ=1 on top is the best measured combination (77.2%, 42 blobs).
+  Over 35 conditions at `prob_threshold=0.6` it is 89.6% recall / 145 blobs against raw's 85.7% /
+  745. Most of that comes from *smoothing the projection* rather than from the restoration net —
+  a plain `gaussian_filter(proj, 1)` reaches 87.5% / 158. Full measurements, and the reason the
+  gain form is the one that keeps confetti identity intact, in
+  [`docs/todo/DENOISE_PLAN.md`](todo/DENOISE_PLAN.md) → *Ratio-preserving restoration*.
+
 The number that frames all of this: **labels cover only ~25% of the colour-carrying area even at
 σ=0.** Three-quarters of the visible cell material is unlabelled, so coverage — not fragment
 cleanup — is the deficit to attack. That points at the training signal: the prob-head target is
 `0.5*bright + 0.3*local_contrast + 0.2*edge`, three grayscale texture statistics, with neither
 confetti (identity) nor flow (separation) connected to it.
+
+### Merging of touching cells: the embeddings do not encode boundaries
+
+Measured 2026-08-04 against synthetic crowded ground truth (`crowdgen`: spatially-shifted,
+time-offset copies of real AF+drift confetti superposed, per-cell GT; 2 movies × 2 densities ×
+3 frames). Three findings, in the order they were established:
+
+1. **`confetti_blur_sigma` is a merge↔split dial, not a separation knob.** Each model at its own
+   best `prob_threshold`: blur 2.0 → F1@.35 65.2% / 4.5% merged / 6.2% split / mask area 0.94× GT;
+   blur 1.0 → 66.6% / 2.4% / 9.2% / 0.71×; no blur → 50.3% / 0.1% / 29.2% / 0.52×. Sharpening the
+   target buys fewer merges by shattering cells and shrinking masks. **1.0 is now the default**
+   (`loss.ConfettiForegroundLoss`, `train.train_with_metrics`) because it wins on F1 outright while
+   roughly halving merges. A no-blur model is *not* broken — its prob map is clean and cell-shaped —
+   but it never reaches 0.5, so a fixed threshold reports zero labels.
+
+2. **Most merging is downstream of the prob head.** Replaying `predict_frame` stage by stage over
+   137 adjacent GT pairs (45 merged): **56% of merges happen in `_merge_split_instances`, 33% in
+   `_grow_regions_fast`, 11% at seeding** (one local maximum for the pair).
+
+3. **The embeddings are blind to cell boundaries, so no post-processing rule can fix this.**
+   `_compute_fragment_affinity` cosines *whole-fragment mean* embeddings; restricting the mean to a
+   band at the contact — where a boundary should show as a step — made merging **worse** (5.1% →
+   5.9% at band=2, and no band width helped). Setting `prob_weight=0`, which stops a bright contact
+   from lowering the growing threshold, did not move merges either. Measuring the embedding field
+   directly, with segmentation out of the way: cosine across a contact is **0.945 within one cell**,
+   **0.943 between adjacent same-colour cells**, **0.920 between adjacent different-colour cells**
+   (Cohen's d = 0.22 vs the within-cell ceiling, n=45 different-colour pairs). A colour boundary is
+   nearly indistinguishable from cell interior.
+
+   This follows from what supervises the embeddings. `VarianceMetricsLoss` is **negatives-only** and
+   mines the k pixels *farthest* in metric space within a window — the easy case, cells that are
+   already far apart — while `TemporalMetricsLoss` *pulls together* pixels with similar motion, which
+   is exactly what two touching cells drifting as a pair have. Adjacent pixels straddling a contact
+   are never presented as a negative. Fixing this is a training change, not an inference one.
+
+Caveat: the synthetic scenes reach only ~4% GT area coverage, well short of mem-TOM crowding, so
+every merge rate above is optimistic.
 
 ## Known issues
 

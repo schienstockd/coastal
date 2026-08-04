@@ -31,11 +31,12 @@ try:
     from coastal.segment import LearnedAffinityInference, TwoPassSegmentationInference, Inference3D
     from coastal.utils import match_masks_3d, intersection_over_union, filter_small_cells
     from coastal.viz import visualize_frame_segmentation, plot_rgb_with_segmentation
-    from coastal.flow import prepare_data_for_unet, compute_variance_metrics, VarianceMetricsConfig, normalize_and_project, extract_dense_flow_pairs
+    from coastal.flow import prepare_data_for_unet, TemporalMetrics, compute_variance_metrics, VarianceMetricsConfig, normalize_and_project, extract_dense_flow_pairs
     from coastal.data import prepare_training_data, validate_training_data
     from coastal.optimize import (
         optimize_segmentation_cma,
         score_segmentation,
+        score_label_size_confetti,
         optimize_tracking_cma,
         score_tracking_scalar,
         TRACKING_PARAM_BOUNDS,
@@ -87,6 +88,7 @@ __all__ = [
     "prepare_data_for_unet_batch_4d",
     "extract_sequences_from_volume",
     "prepare_data_for_unet",
+    "TemporalMetrics",
     "TemporalDatasetWithAugmentation",
     "LearnedAffinityInference",
     "TwoPassSegmentationInference",
@@ -100,6 +102,7 @@ __all__ = [
     "validate_training_data",
     "optimize_segmentation_cma",
     "score_segmentation",
+    "score_label_size_confetti",
     "optimize_tracking_cma",
     "score_tracking_scalar",
     "TRACKING_PARAM_BOUNDS",

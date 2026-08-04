@@ -30,7 +30,7 @@ Adopted cecelia's Claude documentation skeleton:
 ## 2026-07-08 — Notebooks cut over to the installable `cecelia` package
 - Dropped the `CECELIA_APP` / `sys.path` bootstrap in the notebooks; switched to
   `import cecelia.utils.*` against cecelia's new pip-installable package (built out on the
-  cecelia side per `cecelia-pineapple/docs/todo/PY_PACKAGING_PLAN.md`).
+  cecelia side per `cecelia-feijoa/docs/todo/PY_PACKAGING_PLAN.md`).
 - Repointed `BTRACK_CONFIG` at the vendored config via `cecelia.__file__` instead of an absolute
   path; added a `notebooks` extra (`btrack`); documented the `pip install -e <cecelia>/python`
   dev-link step in `docs/DATA.md`.
@@ -80,3 +80,140 @@ Set up `github.com/schienstockd/coastal` and the contribution standards:
 - Cruft + doc drift swept: unused imports, stale docstrings, χ² gate label + Mahalanobis (DeepSORT)
   citation, regenerated `SEGMENTATION.md` metric list, `TRACKING`/`ARCHITECTURE`/`OPTIMIZATION`/
   `MORPHOLOGY` drift.
+
+## 2026-07-30 — Streaming the 4D segmentation path (OOM fix, lazy flow metrics, 8.5× faster frames)
+- **The bug:** `notebooks/pipeline_consensus.ipynb` OOM-killed the kernel at
+  `predict_temporal_volume` on the real `[180, 4, 15, 531, 586]` movies. Four compounding causes —
+  two in the notebook, two in the package: `np.asarray(volumes[uid][0])` materialised the whole
+  6.7 GB movie even though the function streams per z-slice; the tracking cell materialised the same
+  movie a second time; `n_workers=8` ran eight in-flight z-slices, each holding 14 float32 metric
+  planes × T (3.1 GB); and `predict_temporal_volume` retained every prob map and regionprops list.
+- `Inference3D.predict_temporal_volume` now writes per-slice labels straight into the single
+  `[T,Z,H,W]` int32 buffer and Z-stitches it **in place**, dropping each slice's prob maps and
+  regionprops as it finishes (they were retained for all T×Z = 2700 frames, ~6.7 GB, and no caller
+  ever read them). New `keep_results=False` default returns `None` for the second tuple element;
+  pass `keep_results=True` for the old inspection behaviour. Docstring now states the memory
+  contract.
+- Notebook refactored around the streaming seam: lazy dask passed everywhere (`extract_cell_intensities`
+  / `score_tracking` already index per timepoint), `grey` for Farneback built one z-slice at a time,
+  `SEG_WORKERS`/`FLOW_WORKERS` split out as named knobs, and segmented labels cached to
+  `CACHE_DIR` as `.npy` + reloaded with `mmap_mode='r'` so a kernel restart resumes at tracking
+  instead of re-segmenting.
+- **Then removed the ceiling itself: flow metrics are now lazy.** `prepare_data_for_unet` returns a
+  `TemporalMetrics` sequence instead of a list of T dicts — same values, same indexing/slicing/
+  iteration, but each frame's 14 float32 planes are built when asked for. That term was 3.1 GB per
+  in-flight z-slice at T=180 while `predict_sequence` only ever reads one frame at a time. Kept to
+  **one** path rather than a streaming fork: the single lazy type is what everything gets, and the
+  two training entry points (`prepare_data_for_unet_batch_4d` / `_batch`) call `list(...)` because a
+  Dataset indexes per sample per epoch. Deleted `compute_all_temporal_metrics` — it had become a
+  second way to say `list(metrics)`, unused outside its own test.
+- `extract_temporal_metrics` no longer rebuilds and renormalises the **whole stack on every call**
+  just to read one frame out of it (O(T) full-stack copies per z-slice). It scales the one frame it
+  needs, with the global min/max cached by `TemporalMetrics` via a new `frame_range` arg. Measured
+  in isolation: **38.4 s → 0.07 s** per z-slice at T=180, 531×586 — ~10 min of pure waste per
+  15-slice movie. `normalize_and_project` likewise selects channels *before* the float32 cast
+  instead of converting all C and discarding some.
+- **Then the CPU side: per-label loops no longer touch the whole frame.** Profiling `predict_frame`
+  on a real 531×586 frame (~600 labels) put ~90% of its 6.6 s in four `for label in ...` loops doing
+  whole-frame work: `binary_fill_holes` per label (45%), `distance_transform_edt` per fragment (30%),
+  `instances == label` size/reindex passes (9%), and `components == comp_id` per component in the
+  seed-guarantee step. All four now work inside per-label bounding boxes (`find_objects`) or, for
+  `_remove_small_components`, a single `bincount` + lookup-table gather; the embedding blur became one
+  `gaussian_filter(sigma=(s, s, 0))` call instead of 64 per-channel calls. **6.62 → 0.78 s/frame
+  (8.5×)** with **bit-identical labels**, verified by replaying the pre-optimisation `segment.py`
+  straight out of git against the new one over real frames. One z-slice at T=180: **≳20 min → 142 s**.
+- **Found while profiling — the tuned `BEST_PARAMS` were never tuned.** Two independent degeneracies
+  in `optimize_segmentation_cma`, both now fixed or guarded:
+  - `merge_max_distance < 1.0` disables fragment merging outright (`distance_transform_edt(~mask)` is
+    0 on the fragment and ≥1 off it, so a sub-1 threshold selects only the fragment's own pixels,
+    which `& ~mask` removes). The search bound was `(0.5, 3.0)` — a third of it a flat dead zone —
+    now floored at **1.0** and pinned by a test.
+  - `score_segmentation`'s `purity_threshold` was above the achievable range. Measured on a real
+    movie (344 large cells): purity median **0.395**, max **0.558**, floored near `1/n_channels`
+    because `frame / ch_mean` never subtracts background. At the notebook's `purity_threshold=0.8`
+    every candidate scores exactly **0.0**, and `max(history, ...)` returns the *first* tie — so
+    `BEST_PARAMS` is the first sample CMA-ES drew, not an optimum. That explains both the disabled
+    merging and a `merge_affinity_threshold` (0.2261) below `affinity_threshold` (0.5534), which the
+    docstring calls unusual. `optimize_segmentation_cma` now **warns loudly** when the objective
+    never varied, and its docstring no longer misstates the formula (it is
+    `n_good / (n_good + n_merged)`, with fragments excluded from the denominator and free unless
+    `count_penalty_weight > 0`).
+  - Set `merge_max_distance = 1.5` in the notebook to un-break merging. Measured effect on 5 real
+    frames: 2366 → 2277 cells (**−3.8%**), so this is *not* on its own the Y-cell-splitting fix.
+- **Fixed the objective itself, then found it exonerates the parameters.** `score_segmentation` now
+  returns a **reward** — `n_good - junk_weight * (n_merged + n_fragmented)` — with purity computed
+  after per-channel background subtraction (`background_percentile=25`, `None` = legacy).
+  `tests/test_optimize_objective.py` pins the anti-gaming properties behaviourally: dropping a cell,
+  shrinking cells below `min_cell_size`, splitting one into fragments, over-merging two, or adding
+  junk must *each* lower the score, and "find nothing" cannot win. A synthetic case shows four
+  perfectly single-channel cells scoring 0 at **every** threshold with background left in, and 4/4
+  with it removed — so `purity_threshold`'s documented 0.7 default is usable again (baseline good
+  cells on the TEST movie: 171 at 0.7 subtracted, vs 140 under the old metric at a *lower* 0.4).
+- **Then swept `junk_weight` ∈ {0, 0.02, 0.05, 0.1, 0.3}, 200 evals each — and adopted nothing.**
+  `n_good` on the held-out TEST movie is **167–175 for every setting** except the extreme 0.3 (144);
+  what the parameters actually trade is the fragment count (1640–2280). At `junk_weight=0` the score
+  *is* `n_good`/frame, and it spanned **16.6–22.2** across the search with the shipped params already
+  at **20.8** — so these five inference parameters are worth **≤7%** and the shipped values are
+  already within that. Full table in `docs/OPTIMIZATION.md`. The bottleneck is training and
+  oversegmentation (**~86%** of detections are fragments), not the tuner; recorded in `docs/TODO.md`.
+- **Superseded the earlier ratio-based re-tune** (kept below for the record, since the gaming
+  behaviour is the reason the objective changed).
+- **Re-ran the tune with a working objective — and did not adopt the result.** With
+  `purity_threshold=0.4` and a calibrated `count_penalty_weight`, CMA-ES gets a real gradient
+  (0.02–0.28, no flat warning) and converges in ~2 min. But `affinity_threshold` pins to whatever the
+  upper bound is (0.6, then 0.8 when widened), because the score is a ratio over large cells only:
+  on a held-out TEST movie the score rose 0.429 → 0.523 while the absolute number of good cells
+  **fell 140 → 122 → 116**. It improves by discarding cells into the near-free fragment bin. The
+  bound was left at 0.6 rather than widened to chase the wall, and `BEST_PARAMS` keeps its shipped
+  values apart from `merge_max_distance`. Two prerequisite objective fixes are measured and parked in
+  `docs/TODO.md`: background-subtract purity (median 0.385 → 0.709, 34% → 90% of its range, which
+  also makes the documented 0.7 default usable) and stop maximising a ratio over a subset. Both
+  redefine "good segmentation", so the intent is Dominik's call.
+- **Measured on the box** (not estimated): peak RSS for one in-flight z-slice at T=180 went
+  **~7.0 GB → 4.65 GB** (incl. the Torch/CUDA context), which lifts the notebook's `SEG_WORKERS`
+  from 2 to 4 on 31 GB — with ~6 as the ceiling. Together with the loop work a 15-slice movie goes
+  from hours to **~10 min**. The
+  four rewritten notebook expressions were verified **exactly equal** to the numpy ones they replace
+  on real cecelia data (streamed `grey`, `extract_cell_intensities`, `score_tracking`, and tracking
+  on a read-only mmap).
+- Tests (80 total): `tests/test_segment_localised.py` keeps every pre-optimisation implementation
+  **verbatim as the oracle** and compares against the rewrites over randomised label maps (holes,
+  touching pairs, frame-edge cases, `merge_max_distance` 0.62–3.0), plus bit-identity of the
+  argmax tie-break and the single-call embedding blur. `tests/test_segment.py` gains a 4D contract
+  test with a stub UNet — shape/dtype,
+  Z-consistent labels, `keep_results` parity — and pins the streaming guarantee with a lazy
+  stand-in whose `__array__` raises, so re-introducing `np.asarray(volume)` fails the suite.
+  `tests/test_flow_lazy_metrics.py` pins that the per-frame normalisation is **bit-identical** to the
+  old whole-stack copy, that the cached `frame_range` changes nothing, that the sequence really is
+  lazy and uncached, and that channel-selection order in `normalize_and_project` is neutral.
+- Follow-up parked in `docs/TODO.md`: `compute_cumulative_displacement` re-runs consecutive-frame
+  Farneback that the multi-scale pass already computed (~a third of the flow time).
+
+## 2026-07-30 — Confetti/flow as explicit signals (diagnosis good, first retrain failed)
+- **Found why inference tuning was worth ≤7%: the prob-head target is speckle.** `IntensityLoss`
+  builds it as `0.5*bright + 0.3*local_contrast + 0.2*edge` — half a per-pixel intensity threshold,
+  half two edge detectors that peak on boundaries and noise — with no cell-scale structure and **no
+  confetti input at all**. Measured on a real frame: thresholding the prob map gives **2535
+  connected components, 98% under 100 px, median 3 px**. Region growing was cleaning up after a
+  broken foreground.
+- Also measured: supplying the confetti variance channels at inference (they are zero-filled by
+  design, with training-time channel dropout to match) changes nothing — 38.7% → 37.1%
+  multi-colour labels. Kept as an opt-in `predict_frame(variance_metrics=...)` argument, but it is
+  an enabler, not a fix.
+- **Objective now uses both signals in their roles** — *confetti is identity, flow is separation*
+  (Dominik). `score_label_size_confetti` maximises `Σ min(size, cap)²` over labels that are both
+  colour-pure and motion-coherent, divided by `cap × coloured pixels in the image`. Monotone in
+  both error directions, unlike counting `n_good`. The flow term catches same-colour merges that
+  confetti provably cannot see (~270 cells share each of 3 channels, so ~⅓ of merges are
+  same-colour); the image-derived denominator means missing a cell always costs — normalising by
+  *labelled* area instead was a bug in the first cut, reproducing the ratio trap.
+- **`ConfettiForegroundLoss` retrain failed and is off by default.** 80 epochs, 7 TRAIN movies,
+  scored on a held-out movie: baseline 428 labels/frame score **0.0768**; confetti-only 14
+  labels/frame score **0.0010**; confetti + half-intensity 100 labels/frame score **0.0355**. It
+  collapses detection — most likely target scaling (normalised by per-image max after blurring, so
+  typical cells fall below the 0.4 inference threshold), not the premise. Parked in `docs/TODO.md`.
+- **Process note.** The failure initially read as a large win because the diagnostics used
+  (fragment-%, multi-colour-%) have **no coverage term**: 14 labels/frame scored purity 1.000 and
+  4.3% under-segmentation. This is the same "ratio over a subset" trap that produced the original
+  bogus `BEST_PARAMS`, hit a third time in one session. Any segmentation metric used here must have
+  a coverage term.

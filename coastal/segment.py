@@ -10,7 +10,8 @@ See TUNING_GUIDE.md for decision-tree parameter tuning.
 import numpy as np
 import torch
 from scipy import ndimage
-from scipy.ndimage import binary_dilation, gaussian_filter, maximum_filter, distance_transform_edt
+from scipy.ndimage import (binary_dilation, gaussian_filter, maximum_filter,
+                           distance_transform_edt, find_objects)
 from skimage.measure import regionprops
 
 from coastal.device import resolve_device
@@ -121,6 +122,7 @@ class LearnedAffinityInference:
                  min_boundary_pixels=1,
                  prob_threshold=0.3,
                  embedding_blur_sigma=1.5,
+                 prob_blur_sigma=0.0,
                  max_iter=200,
                  min_component_size=20):
         """
@@ -208,22 +210,41 @@ class LearnedAffinityInference:
         # Optional tuning (4)
         self.prob_threshold = prob_threshold
         self.embedding_blur_sigma = embedding_blur_sigma
+        self.prob_blur_sigma = prob_blur_sigma
         self.max_iter = max_iter
         self.min_component_size = min_component_size
 
-    def predict_frame(self, frame, metrics_dict):
-        """Segment using seed-based region growing with embedding+prob-based merging."""
+    def predict_frame(self, frame, metrics_dict, variance_metrics=None):
+        """Segment using seed-based region growing with embedding+prob-based merging.
+
+        Args:
+            frame:            [H, W] projected frame
+            metrics_dict:     the temporal (flow) metrics for this frame
+            variance_metrics: optional cross-channel (confetti) metrics from
+                              `flow.compute_variance_metrics`. Training feeds these as the
+                              trailing input channels — `[frame, sorted(temporal),
+                              sorted(variance)]` — with channel dropout so the model also
+                              works without them, and inference has historically passed
+                              zeros there. Supplying them here fills those channels with the
+                              real signal instead, in the same order training used.
+        """
         frame_norm = (frame - frame.min()) / (frame.max() - frame.min() + 1e-5)
         frame_tensor = torch.from_numpy(frame_norm).float().unsqueeze(0).unsqueeze(0)
 
-        metric_list = []
-        for name in sorted(metrics_dict.keys()):
-            arr = metrics_dict[name]
-            if isinstance(arr, np.ndarray):
-                arr = torch.from_numpy(arr).float()
-            else:
-                arr = arr.float()
-            metric_list.append(arr)
+        def _stack(d):
+            out = []
+            for name in sorted(d.keys()):
+                arr = d[name]
+                out.append(torch.from_numpy(arr).float() if isinstance(arr, np.ndarray)
+                           else arr.float())
+            return out
+
+        # Order matters: training concatenates the temporal block then the variance block,
+        # each sorted within itself (see train.py::_stack_metrics), NOT one merged sort.
+        metric_list = _stack(metrics_dict)
+        n_temporal = len(metric_list)
+        if variance_metrics:
+            metric_list += _stack(variance_metrics)
 
         H, W = frame_tensor.shape[2:]
         if metric_list:
@@ -231,7 +252,7 @@ class LearnedAffinityInference:
         else:
             metrics_stacked = torch.zeros(1, 1, H, W)
 
-        # Pad with zeros for variance channels not available at inference.
+        # Zero-fill whatever the model expects beyond what was supplied.
         n_variance = max(0, self.model.num_metrics - len(metric_list))
         variance_zeros = torch.zeros(1, n_variance, H, W)
         frame_and_metrics = torch.cat([frame_tensor, metrics_stacked, variance_zeros], dim=1).to(self.device)
@@ -240,6 +261,16 @@ class LearnedAffinityInference:
             prob, embeddings = self.model(frame_and_metrics)
             prob_map = torch.sigmoid(prob)[0, 0].cpu().numpy()
             emb_np = embeddings[0].permute(1, 2, 0).cpu().numpy()
+
+        # Speckle suppression. The prob head resolves cells (~15-20 px blobs) but sits on a
+        # 1-3 px noise floor that also crosses prob_threshold, so the foreground mask comes
+        # out as ~3600 blobs of median 3 px per frame. Cells and speckle differ by scale, so
+        # a blur at cell scale separates them where a threshold cannot: measured on a real
+        # frame, sigma=3 cuts the blob count 3612 -> 142 and raises median size 3 -> 64 px
+        # while leaving the number of cell-sized (>=100 px) blobs unchanged at ~57.
+        # See docs/SEGMENTATION.md.
+        if self.prob_blur_sigma > 0:
+            prob_map = gaussian_filter(prob_map, sigma=self.prob_blur_sigma)
 
         H, W, D = emb_np.shape
 
@@ -251,14 +282,16 @@ class LearnedAffinityInference:
         seeds_binary = local_max & binary
 
         # Every connected component above prob_threshold must have at least one seed.
+        # Scoped to each component's bounding box: the brightest pixel of a component is
+        # inside its own box, and row-major order within the box preserves the whole-frame
+        # argmax tie-break, so the seed chosen is the same one.
         components, n_components = ndimage.label(binary)
-        for comp_id in range(1, n_components + 1):
-            comp_mask = components == comp_id
-            if not seeds_binary[comp_mask].any():
-                peak = np.unravel_index(
-                    np.where(comp_mask, prob_map, -1).argmax(), prob_map.shape
-                )
-                seeds_binary[peak] = True
+        for comp_id, sl in enumerate(find_objects(components), start=1):
+            comp_mask = components[sl] == comp_id
+            if not seeds_binary[sl][comp_mask].any():
+                scored = np.where(comp_mask, prob_map[sl], -1.0)
+                local = np.unravel_index(scored.argmax(), scored.shape)
+                seeds_binary[local[0] + sl[0].start, local[1] + sl[1].start] = True
 
         seeds, n_seeds = ndimage.label(seeds_binary)
 
@@ -267,9 +300,11 @@ class LearnedAffinityInference:
 
         emb_norm = emb_np / (np.linalg.norm(emb_np, axis=2, keepdims=True) + 1e-5)
 
-        emb_smoothed = np.zeros_like(emb_norm)
-        for d in range(emb_norm.shape[2]):
-            emb_smoothed[:, :, d] = gaussian_filter(emb_norm[:, :, d], sigma=self.embedding_blur_sigma)
+        # One filter call over [H, W, D] with sigma=0 on the channel axis (an identity
+        # kernel) instead of D separate 2D calls — same separable passes per channel,
+        # without the per-channel Python/scipy overhead (D is 64 in practice).
+        emb_smoothed = gaussian_filter(
+            emb_norm, sigma=(self.embedding_blur_sigma, self.embedding_blur_sigma, 0))
 
         instances = self._grow_regions_fast(emb_smoothed, seeds, binary, prob_map)
 
@@ -340,18 +375,29 @@ class LearnedAffinityInference:
         return instances
 
     def _fill_holes(self, instances):
-        """Fill holes in instance labels (donut-shaped regions become solid)."""
-        from scipy.ndimage import binary_fill_holes
+        """Fill holes in instance labels (donut-shaped regions become solid).
+
+        Each label is processed inside its own bounding box (`find_objects`) with a 1-px
+        zero border, which reproduces the whole-frame result exactly: the label lies
+        entirely within its box, so a background component that escapes the box also
+        escapes to the frame edge, and neither gets filled. Labels are still applied in
+        ascending order, so a hole containing a lower-numbered label is overwritten just
+        as before. Whole-frame `binary_fill_holes` per label was ~45% of segmentation
+        time at ~600 labels/frame.
+        """
+        from scipy.ndimage import binary_fill_holes, find_objects
 
         instances_filled = instances.copy()
 
-        for inst_id in np.unique(instances):
-            if inst_id == 0:
+        for inst_id, sl in enumerate(find_objects(instances), start=1):
+            if sl is None:                      # label id absent from this frame
                 continue
 
-            mask = (instances == inst_id).astype(np.uint8)
-            mask_filled = binary_fill_holes(mask).astype(np.uint8)
-            instances_filled[mask_filled == 1] = inst_id
+            sub = instances[sl] == inst_id
+            padded = np.zeros((sub.shape[0] + 2, sub.shape[1] + 2), dtype=bool)
+            padded[1:-1, 1:-1] = sub
+            filled = binary_fill_holes(padded)[1:-1, 1:-1]
+            instances_filled[sl][filled] = inst_id   # basic slice -> writes through
 
         return instances_filled
 
@@ -365,28 +411,48 @@ class LearnedAffinityInference:
         3. Embeddings are similar (affinity > merge_affinity_threshold)
 
         Both brightness AND affinity must pass.
+
+        Per-fragment work happens inside a padded bounding box instead of on the whole
+        frame (whole-frame EDTs per fragment were ~30% of segmentation time at ~600
+        fragments/frame). Every predicate below thresholds a distance at
+        <= max(1.0, merge_max_distance), so the box only has to be wide enough that those
+        distances match their whole-frame values: a pixel within merge_max_distance of
+        *both* fragments puts the other fragment's nearest pixel within 2x that of this
+        one, so `pad` covers it. Beyond the box the true distance exceeds the threshold,
+        and a cropped transform can only over-estimate, so the predicates stay False
+        either way.
         """
         unique_ids = np.unique(instances)
         unique_ids = unique_ids[unique_ids > 0]
 
+        pad = int(np.ceil(max(1.0, 2.0 * self.merge_max_distance))) + 1
+        boxes = find_objects(instances)
         merges = {}  # id_remove → id_keep
 
         for inst_id in unique_ids:
-            mask = instances == inst_id
+            sl = boxes[inst_id - 1]
+            if sl is None:
+                continue
+            box = tuple(slice(max(0, s.start - pad), min(dim, s.stop + pad))
+                        for s, dim in zip(sl, instances.shape))
+
+            inst_box = instances[box]
+            prob_box = prob_map[box]
+            mask = inst_box == inst_id
             dist1 = distance_transform_edt(~mask)
 
             # Candidates: pixels of other fragments within merge_max_distance
-            candidate_pixels = (dist1 <= self.merge_max_distance) & ~mask & (instances > 0)
-            neighbors = np.unique(instances[candidate_pixels])
+            candidate_pixels = (dist1 <= self.merge_max_distance) & ~mask & (inst_box > 0)
+            neighbors = np.unique(inst_box[candidate_pixels])
 
             for neighbor_id in neighbors:
                 if neighbor_id in merges:
                     continue
 
                 contact_prob, _, _ = self._compute_boundary_intensity(
-                    instances, prob_map, inst_id, neighbor_id, dist1
+                    inst_box, prob_box, inst_id, neighbor_id, dist1
                 )
-                n_contact = self._count_contact_pixels(instances, inst_id, neighbor_id, dist1)
+                n_contact = self._count_contact_pixels(inst_box, inst_id, neighbor_id, dist1)
 
                 # Minimum contact requirement
                 if n_contact < self.min_boundary_pixels:
@@ -419,7 +485,12 @@ class LearnedAffinityInference:
         return instances_merged
 
     def _compute_fragment_affinity(self, instances, embeddings, id1, id2):
-        """Compute cosine similarity between mean embeddings of two fragments."""
+        """Compute cosine similarity between mean embeddings of two fragments.
+
+        Takes the **whole-frame** instances/embeddings on purpose: the means are over every
+        pixel of each fragment, so unlike the distance predicates in
+        `_merge_split_instances` this one cannot be evaluated on a bounding-box crop.
+        """
         mask1 = (instances == id1)
         mask2 = (instances == id2)
 
@@ -481,20 +552,22 @@ class LearnedAffinityInference:
         return int(contact_mask.sum())
 
     def _remove_small_components(self, instances):
-        """Remove instances smaller than min_component_size and reindex."""
-        unique_labels = np.unique(instances)
-        for label_id in unique_labels:
-            if label_id == 0:
-                continue
-            if (instances == label_id).sum() < self.min_component_size:
-                instances[instances == label_id] = 0
+        """Remove instances smaller than min_component_size and reindex.
 
-        unique_labels = np.unique(instances)
-        instances_reindexed = np.zeros_like(instances)
-        for new_id, old_id in enumerate(unique_labels[1:], 1):
-            instances_reindexed[instances == old_id] = new_id
+        Sizes come from one `bincount` and the relabel is a single lookup-table gather,
+        replacing two full-frame comparisons per label (~600 of them per frame). Surviving
+        labels are still renumbered 1..n in ascending order of their old id, so the output
+        is identical to the per-label loop.
+        """
+        counts = np.bincount(instances.ravel())
+        keep = counts >= self.min_component_size
+        keep[0] = False                                    # background is not a label
 
-        return instances_reindexed
+        lut = np.zeros(counts.size, dtype=instances.dtype)
+        surviving = np.flatnonzero(keep)                   # ascending old ids
+        lut[surviving] = np.arange(1, surviving.size + 1, dtype=instances.dtype)
+
+        return lut[instances]
 
     def predict_volume_3d(self, volume_3d, metrics_3d):
         """
@@ -885,6 +958,7 @@ class Inference3D:
         temporal_scales=[1, 2, 4],
         cumulative_window=2,
         n_workers=4,
+        keep_results=False,
     ):
         """Segment a 4D volume [T, C, Z, Y, X] over time.
 
@@ -892,18 +966,38 @@ class Inference3D:
         For each timepoint: stitches Z labels with IOU matching so cells have
         consistent IDs across Z-planes.
 
+        Memory: `volume` should be passed **lazily** (a dask array straight from
+        cecelia) — only one z-slice is materialised at a time, so `np.asarray(volume)`
+        at the call site defeats the streaming and costs T×C×Z×H×W×2 bytes. The two
+        terms that do scale are:
+
+          * per worker  — the z-slice's flow fields (multi-scale + cumulative, ~1.8 GB
+            at T=180, 531×586) held for the lifetime of that slice. The 14 metric planes
+            per frame are computed on demand by `flow.TemporalMetrics`, so only the
+            current frame's are resident. `n_workers` multiplies this, so it is still
+            the dominant cost (see docs/SEGMENTATION.md).
+          * the output  — the [T, Z, H, W] int32 label buffer, written in place.
+
+        Per-slice labels are copied into that buffer and the rest of each
+        `predict_sequence` result (prob maps, regionprops) is dropped as soon as the
+        slice finishes; pass `keep_results=True` to retain them for inspection, which
+        costs a further ~2× the output buffer plus one regionprops list per frame.
+
         Args:
-            volume:            [T, C, Z, Y, X] array
+            volume:            [T, C, Z, Y, X] array; lazy (dask) is preferred
             ch_indices:        channel indices to use for projection/flow (None = all)
             stitch_threshold:  min IOU for label matching across Z (default 0.0)
             gap_tolerance:     bridge chains broken by up to this many bad slices (default 1)
             gap_iou_threshold: min IOU to accept a gap bridge (default 0.3)
             temporal_scales:   Farneback multi-scale parameters
             cumulative_window: cumulative displacement window
+            n_workers:         z-slices segmented concurrently (memory multiplier)
+            keep_results:      keep the full per-slice result dicts (default False)
 
         Returns:
             instances_4d: [T, Z, H, W] int32 matched instance labels
-            results_per_z: list of Z predict_sequence result lists (one per z-slice)
+            results_per_z: list of Z predict_sequence result lists (one per z-slice),
+                           or None when keep_results is False
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from coastal.flow import prepare_data_for_unet, normalize_and_project
@@ -913,10 +1007,15 @@ class Inference3D:
         print(f"\n4D Temporal Segmentation: {T} timepoints × {Z} z-slices × {H}×{W} px")
         print(f"  Using {n_workers} parallel workers\n")
 
+        # Single buffer for the labels: filled per z-slice, then stitched in place.
+        instances_4d = np.zeros((T, Z, H, W), dtype=np.int32)
+        results_per_z = [None] * Z if keep_results else None
+
         def _process_z(z):
             print(f"  Z {z+1:2d}/{Z}: computing flow...", flush=True)
             seq = np.asarray(volume[:, :, z, :, :])  # load one z-slice
             _, frames_proj = normalize_and_project(seq, ch_indices)
+            del seq
 
             frames_prep, _, _, temporal_metrics = prepare_data_for_unet(
                 frames_proj,
@@ -929,33 +1028,38 @@ class Inference3D:
             results_z = self.inferencer_2d.predict_sequence(
                 frames_prep, temporal_metrics, show_progress=False
             )
+
+            # Keep only what the stitching below needs; release the prob maps and
+            # regionprops of this slice before the next one is loaded.
+            for t, r in enumerate(results_z):
+                instances_4d[t, z] = r['instances']
             avg_cells = np.mean([r['num_cells'] for r in results_z])
             print(f"  Z {z+1:2d}/{Z}: done — {avg_cells:.0f} cells/frame avg", flush=True)
-            return z, results_z
+            return z, (results_z if keep_results else None)
 
-        results_per_z = [None] * Z
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             futures = {ex.submit(_process_z, z): z for z in range(Z)}
             for future in as_completed(futures):
                 z, results_z = future.result()
-                results_per_z[z] = results_z
+                if keep_results:
+                    results_per_z[z] = results_z
 
         print(f"\n  Stitching Z labels at each of {T} timepoints...")
-        instances_4d = np.zeros((T, Z, H, W), dtype=np.int32)
 
+        # match_masks_3d copies its input, so writing the result back into the same
+        # timepoint is safe; timepoints are independent, hence the thread pool.
         def _stitch_t(t):
-            masks_at_t = [results_per_z[z][t]['instances'] for z in range(Z)]
-            return t, match_masks_3d(
-                masks_at_t,
+            instances_4d[t] = match_masks_3d(
+                instances_4d[t],
                 stitch_threshold=stitch_threshold,
                 gap_tolerance=gap_tolerance,
                 gap_iou_threshold=gap_iou_threshold,
             )
+            return t
 
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            for t, masks_matched in ex.map(_stitch_t, range(T)):
-                for z, inst in enumerate(masks_matched):
-                    instances_4d[t, z] = inst
+            for _t in ex.map(_stitch_t, range(T)):
+                pass
 
         n_cells_per_t = [int(len(np.unique(instances_4d[t])) - 1) for t in range(T)]
         print(f"  Done. Cells/timepoint: min={min(n_cells_per_t)}, "

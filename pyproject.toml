@@ -44,7 +44,7 @@ dev = [
 # imports). The demo notebooks additionally need:
 #   - btrack           (tracking; pip-installable, listed below)
 #   - the cecelia IO helpers, installed separately as an editable path dep — NOT a PyPI package:
-#         pip install -e <cecelia-pineapple>/python      # import name `cecelia`
+#         pip install -e <cecelia-feijoa>/python      # import name `cecelia`
 notebooks = [
     "btrack",
 ]

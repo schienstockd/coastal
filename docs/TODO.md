@@ -11,7 +11,7 @@ what landed lives in `docs/MILESTONES.md` (and git history once this is a repo).
       (`scripts/link_cecelia.sh` / local path install) with a normal pinned dependency in
       `pyproject.toml` (`cecelia>=<x.y>`), and delete `scripts/link_cecelia.sh`. See
       `docs/DATA.md` → *Installing / keeping cecelia in sync*. Gated on the cecelia-side publish
-      (`cecelia-pineapple/docs/todo/PY_PACKAGING_PLAN.md`, Decision 1 dist-name check).
+      (`cecelia-feijoa/docs/todo/PY_PACKAGING_PLAN.md`, Decision 1 dist-name check).
 
 ### Repo structure / docs
 - [ ] Backfill `TRACKING_SESSION_SUMMARY.md` numbers into `docs/TRACKING.md`'s table when they
@@ -34,5 +34,51 @@ what landed lives in `docs/MILESTONES.md` (and git history once this is a repo).
 - [ ] Hard-negative mining for any learned cost term.
 - [ ] Attention over track history (sequence, not frame pairs).
 
+### Optimization
+- [ ] **Two scorers exist; delete one.** `score_label_size_confetti` is the better-motivated
+      objective ("largest reasonable label size while preserving confetti", monotone in both error
+      directions); `score_segmentation` counts `n_good` and is only weakly sensitive to
+      over-segmentation. The latter is kept only because the tuning sweep in
+      `docs/OPTIMIZATION.md` was measured with it. Once a re-tune is run against the size objective,
+      delete `score_segmentation` and its `junk_weight`/`count_penalty_weight` knobs.
+- [ ] Calibrate `max_cell_size` on real data (default 300 px ≈ an 8 µm cell at 0.497 µm/px). It sets
+      what "reasonable" means and therefore how hard merging is pushed.
+- [ ] **Stop tuning the 5 inference parameters; they are worth ≤7%.** Measured with the fixed
+      objective: `n_good` on a held-out movie is 167–175 across every `junk_weight` setting, and the
+      shipped params are already within 7% of the best found. See `docs/OPTIMIZATION.md` → *these 5
+      parameters are not the lever*. Redirect to training / oversegmentation.
+- [ ] Decide a `junk_weight` if the tuner is used again — it encodes how many fragments a real cell is
+      worth, which is a scientific choice, not a default. It also flips which way
+      `affinity_threshold` is pushed.
+- [ ] Check whether `score_tracking_scalar` has the same "ratio over a subset" flaw — i.e. whether it
+      can be improved by producing *fewer* tracks.
+- [ ] Several parameters still pin at their bounds under the fixed objective (`prob_weight` at 0.0,
+      `affinity_threshold` at 0.6). Low priority given the ≤7% headroom, but it means the bounds, not
+      the data, are choosing those values.
+
+### Segmentation quality (the actual bottleneck)
+- [ ] **Fix `ConfettiForegroundLoss` target scaling, then re-measure.** First attempt collapsed
+      detection: 428 labels/frame -> 14 (confetti only) or 100 (confetti + half intensity), and the
+      size objective fell 0.0768 -> 0.0010 / 0.0355 on a held-out movie. The target is normalised by
+      its per-image **max** after blurring, so typical cells land below the 0.4 inference prob
+      threshold. Try a high percentile instead of max, and a smaller `blur_sigma`. Off by default
+      until measured. (The idea is still the right one: the prob head currently has no confetti and
+      no flow input at all — its target is `0.5*bright + 0.3*contrast + 0.2*edge`.)
+- [ ] **Give the prob head a separation signal.** "Confetti is identity, flow is separation" — the
+      foreground target has neither today, and the objective now has both. A flow-discontinuity term
+      in the prob/boundary target is the missing piece.
+- [ ] **~86% of detections are fragments** (1951 of 2277 below `min_cell_size=100` on a real TEST
+      movie), and inference parameters cannot fix it — they only shuffle the fragment population
+      (1640–2280 across a full tuning sweep) while `n_good` stays flat. This is a training / model
+      problem: the prob map and embeddings decide what is findable. Next lever, not the tuner.
+
 ### Segmentation
 - [ ] Reduce Y-cell splitting without over-merging (current mitigation: merge threshold > 0.90).
+- [ ] **`compute_cumulative_displacement` re-runs Farneback that `compute_multi_scale_optical_flow`
+      already computed.** For each center frame it calls `calc_flow_farneback_between_frames` over
+      its whole window, so at `cumulative_window=2` it does ~2T consecutive-frame flows while
+      scale 1 of the multi-scale pass has already computed all T−1 of them. Roughly a third of the
+      flow time on the 4D path is redundant. The fix is to sum the existing scale-1 flows instead
+      — but only valid when scale 1 is present and the window is consecutive-frame, so it needs a
+      guard rather than an unconditional swap (and must not become a second flow path). Verify
+      values are unchanged before/after with a golden test.

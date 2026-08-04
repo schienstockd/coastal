@@ -75,6 +75,61 @@ the prob map, then merges fragments. `TwoPassSegmentationInference` runs it twic
 
 `Inference3D` applies this per Z-slice and stitches via `utils.match_masks_3d`.
 
+### Memory: the 4D path (`predict_temporal_volume`)
+
+`predict_temporal_volume(volume, ...)` is the entry point for a whole `[T,C,Z,Y,X]` movie, and on
+real confetti movies (`[180, 4, 15, 531, 586]` uint16 ≈ 6.7 GB) it is the one place in coastal where
+RAM is the binding constraint. Three rules:
+
+1. **Pass the volume lazily.** It reads `volume.shape` and then slices `volume[:, :, z, :, :]`, so a
+   dask array straight from cecelia streams one z-slice at a time. `np.asarray(volume)` at the call
+   site materialises the whole movie first and defeats this — the notebook regression that OOM-killed
+   the kernel. `tests/test_segment.py` pins the contract with a stand-in whose `__array__` raises.
+2. **`n_workers` is a memory multiplier, not just a speed knob.** One in-flight z-slice holds its
+   flow fields — multi-scale + cumulative, ~1.8 GB at T=180, 531×586 — for the slice's lifetime.
+   The 14 float32 metric planes per frame are built on demand (`flow.TemporalMetrics`), so only the
+   current frame's are resident; when they were all precomputed this term was 3.1 GB on its own.
+   Measured: **4.65 GB peak RSS** for a single slice including the Torch/CUDA context, down from
+   ~7.0 GB. Cost is linear in `n_workers` — 4 slices plus the 3.4 GB label buffer ≈ 15 GB on a
+   31 GB box (~6 is the ceiling), where 8 under eager metrics wanted ~40 GB and OOM-killed the
+   kernel.
+3. **Per-slice results are dropped by default.** Only `instances` (copied into the single
+   `[T,Z,H,W]` int32 output buffer, then Z-stitched in place) and `num_cells` are kept; the prob maps
+   and regionprops of each frame are released as the slice finishes. Passing `keep_results=True`
+   retains them for inspection and costs a further ~2× the output buffer plus one regionprops list
+   per frame (T×Z of them) — it returns `None` otherwise.
+
+If RAM is still short, cut `T` (segment a temporal window) rather than raising `n_workers`. Note that
+per-chunk temporal windows change the normalisation statistics — `normalize_and_project` and
+`normalize_metric` take percentiles over the frames given — so labels from a chunked run are not
+bit-identical to a whole-movie run.
+
+### Speed: keep per-label work off the whole frame
+
+Frames carry **~600 labels**, so any `for label in np.unique(instances)` loop that touches the whole
+frame costs 600 × H×W. Profiling `predict_frame` on a real 531×586 frame found four such loops
+accounting for ~90% of the 6.6 s/frame — whole-frame `binary_fill_holes` per label (45%),
+whole-frame `distance_transform_edt` per fragment (30%), `instances == label` size/reindex passes
+(9%), and a whole-frame `components == comp_id` per connected component in the seed-guarantee step.
+
+All four are now scoped to per-label bounding boxes (`scipy.ndimage.find_objects`) or replaced by a
+single `bincount` + lookup-table gather, giving **6.62 → 0.78 s/frame (8.5×)** with **bit-identical
+labels** — one z-slice at T=180 went from ≳20 min to **142 s**. The rewrites and their equivalence
+arguments are pinned in `tests/test_segment_localised.py`, which keeps the previous implementations
+verbatim as the oracle. If you add per-label post-processing, follow the same rule: get the label's
+box from `find_objects` and work inside it. Two things that legitimately need the whole frame:
+`_compute_fragment_affinity` (means over every pixel of a fragment) and the embedding blur (one
+`gaussian_filter` call with `sigma=(s, s, 0)` over `[H,W,D]`).
+
+**`merge_max_distance < 1.0` disables fragment merging entirely.** `distance_transform_edt(~mask)` is
+0 on the fragment and ≥1 off it, so a threshold below 1 selects only the fragment's own pixels, which
+`& ~mask` then removes — the candidate set is always empty. The CMA-ES-tuned `BEST_PARAMS` used in
+`notebooks/pipeline_consensus.ipynb` set it to **0.6198**, so with those params
+`_merge_split_instances` only drops small components, and the `merge_affinity_threshold` mitigation
+for Y-cell splitting is inert. Raise `merge_max_distance` to ≥1.0 before tuning any merge threshold.
+(This was previously hidden by cost: the step still spent 30% of the runtime computing whole-frame
+distance transforms that could never produce a candidate.)
+
 ### Default best parameters
 
 ```python
@@ -94,10 +149,41 @@ labels across Z by sparse IOU overlap, then bridges chains broken by ≤ `gap_to
 (`_bridge_label_gaps`). `intersection_over_union` builds the sparse overlap matrix;
 `filter_small_cells(instances_4d, min_voxels)` drops sub-threshold labels per timepoint.
 
+### The foreground is speckle, and it is the real bottleneck
+
+The prob head resolves cells, but sits on a 1–3 px noise floor that also crosses
+`prob_threshold`. Measured on a real frame (T=180 prep): `prob > 0.4` gives **4518 blobs,
+median 3 px, 99% under 100 px** covering 21% of the frame, which region growing then carves into
+~1000 labels. This — not the inference parameters — is why ~86% of detections are fragments.
+
+Two fixes were measured:
+
+- **Raising `prob_threshold` does not work.** 0.4 → 0.9 drops fragments only 88% → 58% while
+  labels collapse 719 → 40: it discards real cells as fast as noise, because most cells' probability
+  overlaps the background texture. (`prob_threshold` is also commented out of `PARAM_NAMES`, so it
+  has never been tuned — but 0.4 is already the best of the values tested.)
+- **`prob_blur_sigma` (new, default 0.0 = off) does suppress the speckle.** Cells (~15–20 px) and
+  speckle (1–3 px) differ by scale, so a blur separates them where a threshold cannot: on the raw
+  mask, σ=3 cuts blobs 3612 → 142 and raises median size 3 → 64 px with the count of cell-sized
+  (≥100 px) blobs unchanged at ~57.
+
+  End-to-end it is a **trade, not a free win**: median label size 24 → 89 px and fragments 88% → 58%,
+  but coverage of the colour-carrying area falls 25% → 19% and the share of labels straddling two
+  colours rises 39% → 54%, so `score_label_size_confetti` nets ~7% *down*. Whether that trade is
+  worth it is a judgement about what tracking needs downstream.
+
+The number that frames all of this: **labels cover only ~25% of the colour-carrying area even at
+σ=0.** Three-quarters of the visible cell material is unlabelled, so coverage — not fragment
+cleanup — is the deficit to attack. That points at the training signal: the prob-head target is
+`0.5*bright + 0.3*local_contrast + 0.2*edge`, three grayscale texture statistics, with neither
+confetti (identity) nor flow (separation) connected to it.
+
 ## Known issues
 
 - **Y-cell splitting** — cells with a body + probing leading edge segment as two instances.
-  Mitigate with `merge_affinity_threshold > 0.90`.
+  Mitigate with `merge_affinity_threshold > 0.90` — but **only after** raising `merge_max_distance` to
+  ≥ 1.0, otherwise no merge candidate is ever generated and the threshold does nothing (see
+  *Speed: keep per-label work off the whole frame*). The notebook's tuned `BEST_PARAMS` sit at 0.6198.
 - **Oversegmentation** — raise `embedding_blur_sigma` (2.0–3.0) or `temporal_weight` in training
   (3.0–4.0).
 
@@ -144,8 +230,12 @@ The UNet's `in_channels` must match the metric count chosen (plus the frame chan
 data contract in `docs/ARCHITECTURE.md`).
 
 ### Cost & troubleshooting
-- Metrics are computed **once** and reused across all training epochs. Multi-scale is markedly
-  slower than frame-to-frame; drop scale 8 (`[1,2,4]`) if too slow.
+- Metrics are computed **once** and reused across all training epochs — `prepare_data_for_unet`
+  returns a lazy `TemporalMetrics` sequence, and the training entry points
+  (`prepare_data_for_unet_batch_4d` / `prepare_data_for_unet_batch`) materialise it with `list(...)`
+  so the Dataset is not recomputing planes every epoch. Single-pass consumers (segmentation
+  inference) iterate it lazily instead — that is what keeps the 4D path in RAM. Multi-scale is
+  markedly slower than frame-to-frame; drop scale 8 (`[1,2,4]`) if too slow.
 - All-zero metrics → check frame normalisation to [0,1]
   (`(f - f.min()) / (f.max() - f.min() + 1e-5)`).
 - Out of memory → fewer temporal scales.

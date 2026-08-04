@@ -265,10 +265,19 @@ class LearnedAffinityInference:
         # Speckle suppression. The prob head resolves cells (~15-20 px blobs) but sits on a
         # 1-3 px noise floor that also crosses prob_threshold, so the foreground mask comes
         # out as ~3600 blobs of median 3 px per frame. Cells and speckle differ by scale, so
-        # a blur at cell scale separates them where a threshold cannot: measured on a real
-        # frame, sigma=3 cuts the blob count 3612 -> 142 and raises median size 3 -> 64 px
-        # while leaving the number of cell-sized (>=100 px) blobs unchanged at ~57.
-        # See docs/SEGMENTATION.md.
+        # a blur at cell scale separates them where a threshold cannot.
+        #
+        # Judge this at matched FOREGROUND AREA, not at matched threshold: the blur lowers every
+        # prob value, so a fixed threshold silently runs it at a stricter operating point and
+        # makes it look worse than it is. At equal area (4 movies x 2 z-planes x 3 frames, recall
+        # scored against raw-grey cell seeds), sigma=1 beats sigma=0 outright — 70.5% vs 68.1%
+        # recall at 1% foreground, with half the blobs (47 vs 104). Larger sigma trades the low-
+        # area end for the high: sigma=3 gives 60.9% at 1% area but 90.7% vs 87.8% at 5%, with 16x
+        # fewer blobs.
+        #
+        # This composes with, rather than replaces, cleaning the INPUT — see
+        # denoise.denoise_preserving_ratio. Denoised input plus sigma=1 is the best measured
+        # combination (77.2% recall at 1% area, 42 blobs). See docs/SEGMENTATION.md.
         if self.prob_blur_sigma > 0:
             prob_map = gaussian_filter(prob_map, sigma=self.prob_blur_sigma)
 

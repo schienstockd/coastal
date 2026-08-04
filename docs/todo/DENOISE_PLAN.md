@@ -268,6 +268,87 @@ the same discipline here:
 - **B3** — *only if B1/B2 clear the bar* — promote to a permanent `coastal/docs/` area doc; wire an
   optional temporal mode into cecelia's cleanup task.
 
+### B2 measured ahead of B1 — motion compensation works, but does not displace the spatial gain
+
+Run directly (no training) on the clean re-import: warp each neighbour into the target frame with
+`flow.calc_flow_farneback_between_frames`, then average. 4 movies × 2 z-planes × 3 frames,
+windows 3–15 (`diag/e11`, `e12`).
+
+| | n=3 | n=5 | n=9 | n=15 |
+|---|---|---|---|---|
+| plain average — noise | −5% | −20% | −36% | −45% |
+| **motion-compensated — noise** | **−13%** | **−27%** | **−41%** | **−49%** |
+| plain — identity | 93.8% | 92.7% | 91.5% | 90.4% |
+| **motion-compensated — identity** | **94.2%** | **92.9%** | **91.9%** | **91.0%** |
+
+**Motion compensation wins at every window on both axes** — worth roughly a 1.4× shorter window
+for the same noise (MC at n=5 ≈ plain at n≈7). That is a real, reproducible effect and it
+validates the B2 idea.
+
+Three things it also settles, two of them against the plan as written:
+
+- **The premise "plain averaging gets worse the longer the window" is wrong as stated.** Plain
+  averaging keeps *reducing noise* monotonically (−5 → −45%); what degrades with window length is
+  **identity** (93.8% → 90.4%). The earlier table said "worse" because it was reading a purity
+  column measured on already-denoised data. The real shape is a trade-off, not a turning point,
+  and motion compensation shifts the trade-off rather than removing it.
+- **It does not help the original errand.** On prob-map speckle, MC temporal is *worse* than a
+  cheap spatial smooth inside the gain wrapper: at prob 0.6, `mc9` gives 87.4% recall / 167 blobs
+  / 3.3% area against the spatial gain's 88.2% / 138 / 2.6%. Segmentation wants the projection
+  cleaned spatially; temporal averaging is the tool for noise *inside a channel*, which a scalar
+  gain cannot touch.
+- **Both temporal variants cost far more identity than the gain wrapper** (≈92% at n=5 against
+  99.8%), because warping resamples and mixes. For confetti, that is the expensive axis.
+
+**Methodological trap, worth keeping:** there is no single noise metric that is fair to both
+families. Temporal sd is mechanically driven to zero by temporal averaging; high-frequency spatial
+residual is mechanically driven to zero by spatial smoothing. Each flatters its own family. The
+numbers above use high-frequency residual, which if anything *under*-credits the spatial arm — and
+the spatial arm still wins on the downstream task. Only the task metric (recall vs foreground
+area) is non-circular; prefer it for any cross-family comparison.
+
+**Verdict on B2:** the mechanism is confirmed — but see the correction below. It does not improve
+segmentation, and for this pipeline it actively hurts.
+
+### Correction — an invalid comparison, and what it hid (`diag/e13`, `e14`)
+
+The first prob-map run substituted the denoised plane into an otherwise-**raw** 20-frame stack.
+The UNet is conditioned on flow metrics computed *between* frames, so that frame's metrics came
+from optical flow between a temporally-averaged image and 19 noisy neighbours, while the spatial
+arm had every frame denoised. That produced a bloated foreground (6.7% vs raw's 4.3%) and made
+temporal denoising look far worse than it is. Redone with all 20 frames denoised (`e13`), recall
+at matched foreground area:
+
+| arm | 2% | 3% | 5% |
+|---|---|---|---|
+| raw | 73.5% | 83.9% | 89.5% |
+| `gaussian_restorer(1)` | 85.3% | 88.2% | 96.5% |
+| **plain temporal mean, n=3** | **86.9%** | **93.6%** | **99.7%** |
+| motion-compensated, n=3 | 79.1% | 87.4% | 94.1% |
+| motion-compensated, n=9 | 84.6% | 83.8% | 94.9% |
+
+Two reversals:
+
+- **Plain temporal averaging is the best restorer**, ahead of every spatial option.
+- **Motion compensation is consistently WORSE than plain averaging** for segmentation — the
+  opposite of the plan's expectation. The mechanism is specific to this pipeline and should have
+  been predictable: coastal's segmenter is **flow-supervised**. Warping frames into alignment is
+  precisely the operation that removes the inter-frame motion the UNet is conditioned on. Motion
+  compensation improves the *image* (e12: less noise, cells stay sharp instead of smearing) while
+  degrading the *features the model reads*.
+
+**Adopted:** `temporal_mean_restorer(3)` inside the ratio-preserving gain. It matches averaging
+the channels directly on segmentation (92.3% vs 92.3% at 3% area) while keeping identity at
+**99.5% against 97.6%** — the wrapper is free here. Default stays `gaussian_restorer` only
+because `denoise_preserving_ratio` also accepts single timepoints, where a time axis does not
+exist.
+
+**Verdict on B1:** weaker than when the plan was written. A three-frame box mean already captures
+most of the available temporal redundancy; training a spatiotemporal net has to beat that, not
+just beat raw. And the one axis a learned model would plausibly win — clean per-channel
+intensities — is not what bottlenecks segmentation. Revisit only if a downstream consumer needs
+them.
+
 ---
 
 ## Attribution (Step 5)
@@ -388,3 +469,91 @@ Dominik is re-processing from the `.oir` originals in cecelia feijoa with the or
 drift-corrected + denoised all available for one movie (`fFnZOv`, which every measurement in this
 session used), the denoiser can finally be tuned against a real before/after instead of a
 double-denoised proxy.
+
+---
+
+## Ratio-preserving restoration — measured on clean data (2026-08-01)
+
+The re-import landed: nine `kSUFux/jHMfOI` movies from the `.oir` originals on one shared 8-bit
+window `[0, 1500]`, drift-corrected, valid boxes written, **not** previously denoised. This is the
+first honest before/after; everything above this line was measured on double-denoised data.
+
+Result: **`denoise.denoise_preserving_ratio`** — smooth the mean projection once, apply it back to
+every channel as a per-pixel scalar gain. **The default restorer is a Gaussian, not Cellpose**:
+the ablation below puts the net 0.7pp ahead, which does not justify making a weights download the
+default path for confetti data. `cellpose_restorer()` stays available as an explicit opt-in. This
+keeps the "get off Cellpose restoration" goal intact rather than re-entering by the back door.
+
+Scripts, logs, per-row JSON and figures: `~/Downloads/TMP/coastal-denoise-experiments/`.
+
+### The problem it solves
+
+Restoring each channel independently runs three different nonlinear corrections on the three
+numbers whose ratio *is* the confetti label. Measured: dominant-channel agreement with raw is
+**78% of cell pixels**, and the wrapper is not the cause — normalising all channels through one
+shared window instead of per-plane reaches only 81%. On mask-integrated colour (what tracking's
+`w_color` consumes) per-channel restoration reaches 95.1%, against **99.8% for the gain**, with a
+5.3× smaller colour shift (L1 on the normalised channel vector: 0.0564 → 0.0106).
+
+Preservation is exact per pixel; mask-integrated colour is a gain-*weighted* mean, hence 99.8% not
+100%. **Absolute intensity is not preserved** — the gain is what changes it. Absolute-brightness
+measurements must read the raw store.
+
+### Segmentation effect (the original errand: speckle in the prob map)
+
+35 conditions — 6 movies × 3 z-planes × 2 timepoint windows — recall scored against cell seeds
+taken from the *raw* grey, so no arm is favoured. At `prob_threshold=0.6`:
+
+| | recall | fg area | blobs | cell mask px |
+|---|---|---|---|---|
+| raw | 85.7% | 3.7% | 745 | 184 |
+| gain | **89.6%** | **2.5%** | **145** | 168 |
+
+Better recall, less foreground, **5× fewer blobs**, slightly tighter masks. Better on 5 of 6
+movies, tied on the sixth. At the instance level (E3) spurious labels drop ~4× at equal recall and
+the merge rate is flat-to-lower — the tighter-but-fuller masks do **not** fuse neighbours.
+
+### Three findings that bound the claim
+
+- **The restorer matters far less than the idea.** Ablation (E9, prob 0.6): raw 84.5% / 596 blobs,
+  `gaussian_filter(proj, 1)` 87.5% / 158, `denoise_cyto3` 88.2% / 138. Most of the win is *smooth
+  the projection*; the net buys +0.7pp and ~13% fewer blobs over a free gaussian. `ratio_preserving_gain`
+  therefore takes `restored` as an argument rather than owning a model. `denoise_nuclei` fails
+  outright (60% of the frame foreground); cyto2 ≈ cyto3.
+- **The advantage is largest on bright cells.** At matched foreground area (E10), gain leads by
+  ~+6pp on p99 seeds, +2–7pp on p97, and −0.8 to +3.7pp on p95. Scored at a fixed *threshold*
+  instead (E6) gain appears to lose dim cells by 11pp — that is an artifact of raw's larger mask,
+  not sensitivity. **Compare denoising arms at matched area, never at matched threshold.**
+- **`GAIN_CAP` is a guard, not a knob.** Swept 1.0 → 4.0: recall flat (~89%) at every value,
+  everything ≥ 1.3 numerically identical. It binds on ~0.5% of pixels (those where the projection
+  sits at the noise floor; measured max ratio 2.6e4). Clipping rescales the shared factor, so it
+  does **not** break ratio preservation.
+
+### It composes with `prob_blur_sigma`
+
+Judged at matched foreground area rather than matched threshold, `prob_blur_sigma` is a legitimate
+tool, and denoising the input does not replace it — the two stack:
+
+| arm | recall @1% area | @2% | @5% | blobs @1% |
+|---|---|---|---|---|
+| raw | 68.1% | 80.5% | 87.8% | 104 |
+| raw + σ=1 | 70.5% | 81.5% | 89.1% | 47 |
+| gain | 75.9% | 86.3% | 93.7% | 63 |
+| **gain + σ=1** | **77.2%** | **87.1%** | **93.8%** | **42** |
+
+### Reservations
+
+- The UNet (`coastal_model.pt`) was trained on the **old** double-denoised, per-channel-windowed
+  movies. Every number here applies it out of distribution. A retrain on gain-restored input is
+  untested and could move all of it.
+- Per-channel temporal noise barely improves (−10%), far worse than a plain gaussian (−68%) or
+  median 3×3 (−69%) — a scalar gain cannot remove noise that lives inside a channel. The
+  segmentation win comes from the projection, not from cleaner channels.
+- 3D stitching (E8): gain does not harm it and modestly helps (single-z labels 76.5% → 68.3%,
+  median volume 50 → 69), but **both** arms under-stitch — median z-extent 1.0 where 10:1
+  anisotropy (5 µm z vs 0.497 µm xy) and ~8–10 µm cells predict ~2. Pre-existing, worth its own
+  look.
+- Seeds come from local maxima of the raw grey, so "recall" is detection of *those* maxima, not of
+  ground truth. There is no GT here.
+- cecelia's `cleanupImages.cellposeCorrect` still denoises "each channel independently" — the path
+  that produced the 78%/95% identity above. Adopting this upstream is a separate cecelia change.

@@ -32,30 +32,37 @@ class ConfettiForegroundLoss(nn.Module):
     perfectly good to this signal, so it cannot penalise over-segmentation on its own —
     the blur is what supplies a size prior.
 
-    **Measured result of the first attempt: this made segmentation worse.** Trained on the
-    real movies (80 epochs, 7 TRAIN movies) and scored on a held-out movie with
-    `optimize.score_label_size_confetti`:
+    **The first attempt collapsed detection, and the cause was target scaling, not the
+    idea.** The blurred colour-confidence map was normalised by its per-image **max**, so
+    only the brightest cell approached 1.0 while typical cells landed well below the prob
+    threshold used at inference — on real frames just 22% of cells cleared it. Normalising
+    by `norm_percentile` (default p99) instead puts 100% of them above it. Retrained on the
+    16-bit AF+drift movies that fix turns 2834 blobs / 161 labels / median 36 px into
+    87 blobs / 32 labels / median 90 px, with full cell coverage.
 
-        baseline (IntensityLoss)          428 labels/frame   score 0.0768
-        confetti_weight=1, intensity=0     14 labels/frame   score 0.0010
-        confetti_weight=1, intensity=0.5  100 labels/frame   score 0.0355
+    `blur_sigma` is a merge↔split dial, not a separation knob: measured against synthetic
+    crowded ground truth (2 movies x 2 densities x 3 frames, each at its own best prob
+    threshold), all three settings sit on one frontier —
 
-    It collapses detection. The likely cause is target scaling in `forward`, not the idea:
-    the blurred colour-confidence map is normalised by its per-image **max**, so only the
-    brightest cell approaches 1.0 while typical cells land well below the 0.4 prob
-    threshold used at inference — so the model learns a very sparse foreground. Normalising
-    by a high percentile instead of the max (and/or reducing `blur_sigma`) is the obvious
-    next thing to try. Until that is measured, treat this loss as unvalidated; it is off by
-    default (`confetti_weight=0.0`).
+        blur 2.0   thr 0.50   F1@.35 65.2%   merged 4.5%   split  6.2%   area/GT 0.94
+        blur 1.0   thr 0.40   F1@.35 66.6%   merged 2.4%   split  9.2%   area/GT 0.71
+        no blur    thr 0.15   F1@.35 50.3%   merged 0.1%   split 29.2%   area/GT 0.52
 
-    Beware the metrics that made it look like a success: fragment-% and multi-colour-% both
-    improved dramatically (86%→90% frag but 38.7%→4.3% under-segmentation, purity 1.000)
-    because neither has a coverage term. Any objective without one rewards finding nothing.
+    Sharpening the target buys fewer merges by shattering cells and shrinking masks. 1.0 is
+    the default because it wins on F1 outright while roughly halving merges; do not read it
+    as a fix for touching cells of different colour. Most of what remains is downstream —
+    56% of merges come from `segment._merge_split_instances`, 33% from region growing.
+
+    Beware the metrics that made the collapsed version look like a success: fragment-% and
+    multi-colour-% both improved dramatically (86%→90% frag but 38.7%→4.3% under-
+    segmentation, purity 1.000) because neither has a coverage term. Any objective without
+    one rewards finding nothing.
     """
 
-    def __init__(self, blur_sigma: float = 2.0):
+    def __init__(self, blur_sigma: float = 1.0, norm_percentile: float = 99.0):
         super().__init__()
         self.blur_sigma = blur_sigma
+        self.norm_percentile = norm_percentile
 
     def _blur(self, x):
         """Separable Gaussian at cell scale, so the target is blobs not pixels."""
@@ -89,11 +96,148 @@ class ConfettiForegroundLoss(nn.Module):
             targets.append(stack.max(dim=0).values)     # dominant-colour confidence
         target = torch.stack(targets, dim=0).unsqueeze(1)   # [B, 1, H, W]
         target = self._blur(target)
-        # Rescale per image so the brightest cells read as foreground.
-        flat = target.view(target.size(0), -1)
-        hi = flat.max(dim=1).values.view(-1, 1, 1, 1) + 1e-6
-        target = torch.clamp(target / hi, 0, 1)
+        # Rescale per image so cells read as foreground. Normalise by a high PERCENTILE, not the
+        # max: with the max, one unusually bright cell sets the scale and every typical cell lands
+        # far below the inference prob_threshold, so the model learns a near-empty foreground. That
+        # is the diagnosed cause of the first retrain collapsing to 14 labels/frame (see the class
+        # docstring). A percentile is insensitive to that single outlier; values above it clamp
+        # to 1, which is what a saturated cell should read as anyway.
+        #
+        # p99 measured on real AF-corrected frames (kSUFux/jHMfOI, r0hufV + ag0pAo): the fraction
+        # of detected cells whose target clears the 0.4 inference threshold is 21-24% under `max`,
+        # 92-93% at p99.5 and 100% at p99, for ~2.5% frame coverage - which matches the actual
+        # cell density. Below p98 the target starts claiming background.
+        # .float(): under AMP the target arrives as float16 and torch.quantile rejects it.
+        flat = target.view(target.size(0), -1).float()
+        hi = torch.quantile(flat, self.norm_percentile / 100.0, dim=1).view(-1, 1, 1, 1) + 1e-6
+        target = torch.clamp(target.float() / hi, 0, 1)
         return F.binary_cross_entropy_with_logits(pred_prob.float(), target)
+
+
+class ConfettiBoundaryLoss(nn.Module):
+    """Push embeddings apart across a confetti-colour boundary; pull them together within a colour.
+
+    Measured motivation. Segmentation merges **86.7% of real touching different-colour cell
+    pairs** (465 pairs mined from all 9 confetti movies, colour as ground truth). The
+    embeddings are the reason: cosine across a different-colour contact is 0.920 against
+    0.945 within a single cell — Cohen's d = 0.22, i.e. a cell boundary is nearly
+    indistinguishable from cell interior. Nothing downstream can recover that; see
+    docs/SEGMENTATION.md.
+
+    Why the existing terms do not supply it:
+
+    - ``VarianceMetricsLoss`` is negatives-only and mines the k pixels *farthest* in metric
+      space within a window — cells that are already far apart, the easy case. Two pixels
+      straddling a contact are never presented as a negative.
+    - ``TemporalMetricsLoss`` *pulls together* pixels with similar motion, which is exactly
+      what two touching cells drifting as a pair have. It actively fuses them.
+
+    So this term mines the contacts **explicitly** rather than sampling and hoping. That
+    matters because contacts are rare: the training movies are sparse, and a random window
+    almost never contains one. Explicit mining is what makes the signal usable at this
+    density — but it cannot manufacture events that are not there, so genuinely crowded
+    confetti data remains the real fix.
+
+    A pixel pair at offset ``offsets`` is a **negative** when the two pixels' dominant
+    confetti channels differ and both are confidently coloured, and a **positive** when they
+    agree. Negatives get a hinge on cosine similarity; positives a symmetric pull, so the
+    term cannot be minimised by simply scattering every embedding.
+
+    Confetti is used to build the *pairing*, never as model input — identical in kind to
+    ``ConfettiForegroundLoss``. At inference the variance channels are zero-filled and the
+    network must predict boundaries from greyscale + flow alone. That caps what this can
+    achieve: ~24% of real contacts are co-moving, and for those nothing in the input
+    distinguishes the contact from cell interior. The other ~76% have resolvable relative
+    motion (median 2.10 px/frame against a 1.28 px/frame within-cell noise floor).
+    """
+
+    def __init__(self, margin: float = 0.5, min_confidence: float = 0.5,
+                 offsets: tuple = (2, 4), pos_weight: float = 0.3,
+                 max_pairs: int = 4096):
+        super().__init__()
+        self.margin = margin
+        self.min_confidence = min_confidence
+        self.offsets = offsets
+        self.pos_weight = pos_weight
+        self.max_pairs = max_pairs
+
+    @staticmethod
+    def _colour(m, device):
+        """(dominant channel, confidence) from the softmax_ch_* metrics, or None."""
+        keys = sorted(k for k in m.keys() if k.startswith('softmax_ch_'))
+        if len(keys) < 2:
+            return None, None
+        stack = torch.stack([
+            (v if isinstance(v, torch.Tensor) else torch.from_numpy(v)).to(device).float()
+            for v in (m[k] for k in keys)
+        ], dim=0)                                        # [C, H, W]
+        total = stack.sum(dim=0) + 1e-6
+        conf, dom = (stack / total).max(dim=0)           # share held by the winner
+        # Scale by brightness so background — where one channel "wins" on noise alone — is
+        # never confidently coloured. Percentile, not max, for the same reason as
+        # ConfettiForegroundLoss: one bright cell must not set the scale.
+        bright = stack.sum(dim=0)
+        hi = torch.quantile(bright.flatten().float(), 0.99) + 1e-6
+        return dom, conf * torch.clamp(bright / hi, 0, 1)
+
+    def forward(self, metric_emb, variance_metrics):
+        """
+        Args:
+            metric_emb:        [B, D, H, W] embeddings
+            variance_metrics:  list of B dicts with `softmax_ch_*` [H, W] arrays
+        Returns:
+            Scalar loss, or 0.0 when no confetti metrics are supplied (so it is a no-op at
+            inference and on grayscale-only training data).
+        """
+        if not variance_metrics:
+            return torch.zeros((), device=metric_emb.device, dtype=torch.float32)
+
+        device = metric_emb.device
+        emb = F.normalize(metric_emb.float(), dim=1, p=2)
+        B = emb.shape[0]
+        losses = []
+
+        for b in range(B):
+            m = variance_metrics[b] if isinstance(variance_metrics, list) else variance_metrics
+            dom, conf = self._colour(m, device)
+            if dom is None:
+                continue
+            valid = conf > self.min_confidence
+            e = emb[b]                                   # [D, H, W]
+
+            for off in self.offsets:
+                # Compare each pixel with the one `off` away, along each axis in turn. A colour
+                # boundary shows up as a pair that is close in space but different in colour.
+                for axis in (0, 1):
+                    lo = (slice(off, None), slice(None)) if axis == 0 else \
+                         (slice(None), slice(off, None))
+                    hi = (slice(None, -off), slice(None)) if axis == 0 else \
+                         (slice(None), slice(None, -off))
+                    a, b_ = e[(slice(None),) + lo], e[(slice(None),) + hi]
+                    if a.numel() == 0:
+                        continue
+                    d1, d2 = dom[lo], dom[hi]
+                    both = valid[lo] & valid[hi]
+                    if not both.any():
+                        continue
+                    sim = (a * b_).sum(dim=0)            # cosine, embeddings are unit norm
+                    diff = both & (d1 != d2)             # across a colour boundary
+                    same = both & (d1 == d2)             # within one colour
+
+                    if diff.any():
+                        s = sim[diff]
+                        if s.numel() > self.max_pairs:
+                            s = s[torch.randperm(s.numel(), device=device)[:self.max_pairs]]
+                        losses.append(torch.clamp(self.margin + s, min=0.0).mean())
+                    if same.any() and self.pos_weight > 0:
+                        s = sim[same]
+                        if s.numel() > self.max_pairs:
+                            s = s[torch.randperm(s.numel(), device=device)[:self.max_pairs]]
+                        losses.append(self.pos_weight * (1.0 - s).mean())
+
+        if not losses:
+            return torch.zeros((), device=device, dtype=torch.float32)
+        return torch.stack(losses).mean()
 
 
 class IntensityLoss(nn.Module):

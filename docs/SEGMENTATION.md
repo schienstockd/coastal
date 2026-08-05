@@ -42,13 +42,25 @@ Pure `torch.nn` (ConvBlock, MaxPool, Upsample, ModuleList). ~107 LOC.
 total_loss = intensity_weight * L_intensity + temporal_weight * L_temporal
 ```
 
-- **`IntensityLoss`** — rewards bright pixels, local contrast, edge strength. No labels.
+- **`ForegroundLoss`** — brightness blurred to cell scale, p99-normalised. **The prob-head
+  supervisor to use**, on confetti and non-confetti data alike; see *What confetti actually
+  contributes* below for why it replaces both of the two options under it.
+- **`IntensityLoss`** — rewards bright pixels, local contrast, edge strength. No labels. Its target
+  has no cell-scale structure and trains the prob head toward speckle (measured: median blob size
+  **1 px**). Superseded by `ForegroundLoss`.
+- **`ConfettiForegroundLoss`** — the same objective as `ForegroundLoss` but keyed on dominant-colour
+  confidence. Measured to produce the same target to r ≥ 0.99, so it buys nothing over brightness
+  and requires confetti input channels that are zeros at inference.
 - **`TemporalMetricsLoss`** — hard contrastive: pixels with similar optical-flow metrics should
   be close in embedding space.
+- **`ConfettiBoundaryLoss`** — pushes embeddings apart across a colour boundary. Off by default;
+  needs both crowded confetti data and a lower `min_confidence` to fire at all.
 - **`VarianceMetricsLoss`**, **`WarpConsistencyLoss`** — alternative/auxiliary objectives.
 
 Default weights: `intensity_weight=1.0, temporal_weight=2.0`. Raise `temporal_weight` (3.0–4.0)
-to reduce oversegmentation.
+to reduce oversegmentation. For a no-confetti run, prefer
+`intensity_weight=0.0, foreground_weight=1.0`; when confetti metrics are available, pass them with
+`variance_as_input=False` so they supervise without becoming dead input channels.
 
 ## 4. Training (`train.py`)
 
@@ -98,6 +110,28 @@ RAM is the binding constraint. Three rules:
    and regionprops of each frame are released as the slice finishes. Passing `keep_results=True`
    retains them for inspection and costs a further ~2× the output buffer plus one regionprops list
    per frame (T×Z of them) — it returns `None` otherwise.
+
+**`predict_temporal_volume`'s flow defaults do not match the training defaults, and the mismatch is
+silent.** It defaults to `temporal_scales=[1,2,4], cumulative_window=2`, which yields **14** flow
+metrics; `prepare_data_for_unet` (and therefore `prepare_data_for_unet_batch_4d`, i.e. training)
+defaults to `[1,2,4,8], cumulative_window=5`, which yields **15** — the extra one is `mag_8`.
+
+`predict_frame` stacks metrics in `sorted(key)` order, so a missing `mag_8` does not leave a hole at
+its own position: every metric sorting after it (`normal_flow`, `strain`, `tangential_flow`,
+`vorticity`) shifts down one channel into a slot the model learned as something else, and
+`n_variance = max(0, num_metrics - len(metric_list))` then zero-fills one channel at the *end*. The
+shapes match, so nothing raises — the model is simply fed misaligned inputs.
+
+Always pass the values training used explicitly:
+
+```python
+inf3d.predict_temporal_volume(volume, ch_indices=[...],
+                              temporal_scales=[1, 2, 4, 8], cumulative_window=5)
+```
+
+The metric count also depends on `T`: fewer than 9 frames drops `mag_8` regardless of the scales
+requested, so a short test sequence silently trains/infers on 14 channels. Check the
+`Input channels:` line the trainer prints against `len(metrics_dict)` at inference.
 
 If RAM is still short, cut `T` (segment a temporal window) rather than raising `n_workers`. Note that
 per-chunk temporal windows change the normalisation statistics — `normalize_and_project` and
@@ -195,7 +229,30 @@ cleanup — is the deficit to attack. That points at the training signal: the pr
 `0.5*bright + 0.3*local_contrast + 0.2*edge`, three grayscale texture statistics, with neither
 confetti (identity) nor flow (separation) connected to it.
 
-### Merging of touching cells: the embeddings do not encode boundaries
+### Merging of touching cells — finding 3 RETRACTED, see the notice below
+
+> **RETRACTION (2026-08-05).** Finding 3 below ("the embeddings are blind to cell boundaries",
+> cosine 0.945 / 0.943 / 0.920, Cohen's d = 0.22, n=45) was measured on `crowdgen` synthetic scenes.
+> Two sections further down, and commit `2e2f05d`, establish that **`crowdgen` cannot validate
+> separation — superposed copies never interact.** Time-offset copies of the same movie are
+> statistically independent crops: they never repel, never deform against each other, and there is no
+> membrane interface. The flow field at a synthetic "contact" is two independent motions summed, which
+> is not what a real contact is, so an embedding cosine measured there has no physical meaning.
+>
+> **What survives:** the *symptom* — segmentation merges **86.7% of 465 real** touching
+> different-colour pairs (see *A real validation set*). That was measured on real movies and stands.
+>
+> **What does not:** the *mechanism*. There is no established evidence that the embeddings are
+> boundary-blind, and therefore no basis for the conclusion that no post-processing rule could help,
+> nor for the `ConfettiBoundaryLoss` post-mortem which explains that loss's failure with the same
+> synthetic numbers (`d 0.22 → 0.40`). Combined with the unreachable `min_confidence` gate documented
+> in the amendment above, there are two independent reasons to treat the boundary approach as
+> **untested rather than refuted**.
+>
+> Settling it needs real confetti with real cell–cell repulsion, and more than 3 colours (with 3,
+> ~270 cells share each — see `docs/FUTURE.md`). Findings 1 and 2 are also `crowdgen`-based and carry
+> the same caveat; finding 2's stage attribution is about where merges occur mechanically, which is
+> less sensitive to whether the contact is physical, but it has not been re-checked on real pairs.
 
 Measured 2026-08-04 against synthetic crowded ground truth (`crowdgen`: spatially-shifted,
 time-offset copies of real AF+drift confetti superposed, per-cell GT; 2 movies × 2 densities ×
@@ -297,6 +354,10 @@ Scored on the 465 real pairs:
 | baseline (confetti blur 1.0) | 86.7% | 13.3% |
 | + boundary loss | **89.7%** | 10.3% |
 
+The embedding measurement below is **`crowdgen`-derived and retracted** — see the retraction notice
+under *Merging of touching cells*. The 86.7% merge rate above is real; this explanation for it is
+not established, so "it made segmentation worse" stands as an observation without a mechanism.
+
 The embedding measurement explains it. Under the real inference condition (variance channels
 zero-filled) the boundary model **did** improve separation, d 0.22 → 0.40 — and this is *not* a
 shortcut through the confetti input channels: supplying them changes d only 0.40 → 0.44. But the
@@ -326,6 +387,202 @@ a coherence loss. **The sparse confetti movies contain ~0.1% of the signal this 
 mechanism is sound and ready; genuinely crowded confetti data is the prerequisite, and it is also
 the only data containing the cell–cell avoidance behaviour that would make the flow signature
 learnable in the first place. Revisit when the crowded confetti mice are available.
+
+#### Amendment (2026-08-04): it is not only a data limit — `min_confidence` is the larger lever
+
+The conclusion above ("a data limit, not a design flaw") is half right. Re-measured on
+`ccidDriftCorrected` mid-z, 6 frames, counting pairs exactly as `forward` mines them:
+
+| `min_confidence` | negative pairs / frame (r0hufV) | negative pairs / frame (fXgbTl) |
+|---|---|---|
+| **0.5 (shipped)** | **0** | **0** |
+| 0.4 | 22 | 0 |
+| 0.35 | 77 | 30 |
+| 0.3 | 160 | 107 |
+
+**The default gate sits above the achievable confidence range.** `_colour` returns
+`dominance_share × clamp(brightness/p99)`, and the dominance share is pinned near its `1/C` floor
+(see *What confetti actually contributes* below), so the confidence maxes out at **0.556** on
+r0hufV and **0.457** on fXgbTl — on fXgbTl the 0.5 gate therefore admits *nothing at all*, and the
+term is an exact no-op rather than a starved one. Dropping the gate to 0.3 recovers 160 negatives
+per frame on the same data: a ~50× swing from a parameter, against the ~3/frame that the 42-frame
+count above attributed to data scarcity.
+
+So both effects are real, and the gate is the one that is cheap to fix. Two things follow for when
+the crowded confetti data lands:
+
+1. **Do not turn `boundary_weight` on without lowering `min_confidence`** — at 0.5 the term is
+   753 positives and 0 negatives per frame on real confetti, i.e. it *only* pulls embeddings
+   together, which is the same fusion this loss was written to counteract in `TemporalMetricsLoss`.
+   That is consistent with the measured outcome above (within-cell cosine tightened 0.945 → 0.965,
+   different-colour barely moved) — the loss did what a positives-only objective must do.
+2. **Rebalance the halves.** Even at `min_confidence=0.3` the ratio is 4089 positives to 160
+   negatives; with `pos_weight=0.3` the pull still outweighs the push ~7.7:1. Crowded data raises
+   the negative count but will not by itself fix a ratio that starts two orders of magnitude out.
+
+A peakier, more local softmax helps the co-expressed data specifically (raw-channel dominance at
+`softmax_temp=0.05, pool_radius=2`: 90 negatives/frame on fXgbTl vs 2 on r0hufV) because its
+markers are spatially interleaved rather than sparse.
+
+## What confetti actually contributes (2026-08-04)
+
+Confetti plays **four separate roles** in this pipeline, and they were being reasoned about as one
+thing. Separated and measured, three of them do no work:
+
+| role | where | status |
+|---|---|---|
+| model **input** channels | `train.TemporalDatasetWithAugmentation` concatenates `softmax_ch_*` onto `frame_and_metrics` | **always zeros at inference** |
+| prob-head **supervision** | `loss.ConfettiForegroundLoss` | colour term **inoperative** (r ≥ 0.99 vs colour-blind) |
+| embedding **supervision** | `loss.ConfettiBoundaryLoss` | 0 negative pairs at the shipped gate (above) |
+| embedding **contrastive** | `loss.VarianceMetricsLoss` | negatives-only, never presents a contact |
+
+This matters because the next data is multi-marker, not confetti. `zolIMa/fXgbTl` is
+SHG / nuc-GFP / mem-Tom / CD169-Kat, where **the confetti premise is simply false**: nuc-GFP and
+mem-Tom label the nucleus and the membrane of the *same* cell, so a correct segmentation spans two
+colours, and SHG is collagen rather than a cell at all.
+
+### The input channels are zeros at inference (but that is not what costs accuracy)
+
+`TwoPassSegmentationInference.predict_frame` — the production path — takes no `variance_metrics`
+argument, and `LearnedAffinityInference` zero-fills whatever the model expects beyond what it was
+given. Training presents each variance channel with `variance_dropout_p=0.5` as a plain mask with no
+inverted-dropout rescale, so all three zero at once is a **12.5%** corner of the training
+distribution but **100%** of inference.
+
+`variance_as_input=False` (new) keeps confetti as *supervision only*, which is all three confetti
+losses need — they read `variance_metrics_norm` directly, not the input tensor. Previously the two
+were coupled: you could not have the supervision without the dead input channels.
+
+Worth being precise about the benefit: removing the channels is right because a model should not be
+trained on inputs it will never see, and it drops 3 of 19 input channels. It is **not** measurably
+more accurate — measured, the opposite (see *Deconfounding* below). Do not justify it on accuracy.
+
+### The colour term in `ConfettiForegroundLoss` does no work — even on confetti
+
+Its target is `max_c softmax_ch_c`, which is `dominance × brightness`. Measured against the same
+target built from **brightness alone** (`loss.ForegroundLoss`), on `ccidDriftCorrected` mid-z,
+6 frames:
+
+| data | pearson r | foreground IoU @0.4 |
+|---|---|---|
+| kSUFux/r0hufV — real confetti | **0.9993** | 96.3% |
+| zolIMa/fXgbTl — co-expressed markers | 0.9986 | 94.1% |
+| 4kS67f/3w4IY5 — two cell types | 0.9906 | 83.0% |
+
+The mechanism: `compute_variance_metrics` softmaxes across channels at `temp=0.3` over
+Gaussian-pooled (`pool_radius=5`) intensities, then rescales **each channel independently** with
+`normalize_metric`, which undoes the cross-channel comparability the softmax just established. The
+dominance share is left pinned near its `1/C` floor — in the foreground on real confetti (C=3,
+floor 0.333): p5 0.356, median 0.397, p95 0.528, and **0% of foreground pixels are unambiguously
+one colour** (dominance > 0.8). A near-constant multiplier cannot carry identity.
+
+So the reported win of `ConfettiForegroundLoss` over `IntensityLoss` (2834 blobs → 87, median
+36 → 90 px) is attributable to **the cell-scale blur and the p99 rescale**, not to confetti. Both now
+live in the shared `loss._blob_target`, so the two losses cannot drift apart.
+
+A related consequence: the same per-channel rescale corrupts the colour *label*. Against the argmax
+of raw per-channel intensity, on pixels with an unambiguous raw colour, `ConfettiBoundaryLoss._colour`
+agrees only **52.7%** of the time on r0hufV and **38.3%** on fXgbTl, with a systematic channel swap.
+Its `min_confidence` gate is what rescues it — of the pixels it admits, 93–95% are correct — but see
+the amendment above for how little that leaves.
+
+### Trained models: `ForegroundLoss` is the no-confetti path
+
+Trained on the one 16-bit crop available (`zolIMa/fXgbTl` `ccidDriftCorrected`, 3 z-planes × 31
+frames = 93 frames, 72 train / 21 held out, 30 epochs), scored on 12 held-out frames **at matched
+foreground area** — never at matched threshold, since at `prob_threshold=0.4` these arms sit at
+34.5% / 9.9% / 6.2% foreground area and any statistic read there compares operating points:
+
+| arm | @1% area: blobs / median px | @2% | @5% |
+|---|---|---|---|
+| `IntensityLoss` | 861 / 1.0 | 1473 / 1.0 | 2772 / 1.0 |
+| **`ForegroundLoss`** | **32 / 18.0** | **59 / 11.5** | **118 / 7.0** |
+| `ConfettiForegroundLoss` | 66 / 1.9 | 118 / 1.7 | 248 / 1.0 |
+
+`IntensityLoss` reproduces its documented failure exactly — a median blob size of **1 px** at every
+operating point, i.e. pure speckle. `ForegroundLoss` gives 27× fewer blobs and an 18× larger median
+blob, and also recovers more of the cell material (58.5% vs 46.0% at 1% area).
+
+#### Deconfounding: the confetti arm differed in three ways at once, and neither obvious story held
+
+The confetti arm above carried the confetti prob-head loss **and** `VarianceMetricsLoss` on its
+embeddings **and** three input channels that are zero at inference. The heads share a trunk
+(`model.encode_decode`), so the embedding loss moves the prob map too, and the three could not be
+told apart. Two further arms, identical except as named:
+
+| arm | prob-head loss | `VarianceMetricsLoss` | confetti input channels | @1%: blobs / med / cov |
+|---|---|---|---|---|
+| `foreground` | ForegroundLoss | — | — | **32 / 18.0 / 58.5%** |
+| `confetti` | Confetti | yes | yes | 66 / 1.9 / 55.6% |
+| `confetti_novarin` | Confetti | yes | **no** | 83 / 3.8 / 42.5% |
+| `foreground_varloss` | ForegroundLoss | yes | no | 60 / 8.8 / 36.6% |
+
+Two things this refutes, both of which were plausible:
+
+* **The input-mismatch story is not supported.** Removing the zero-at-inference channels
+  (`confetti` → `confetti_novarin`) made the prob map *worse*, not better — 66 → 83 blobs, coverage
+  55.6% → 42.5%. An earlier draft of this section attributed `ForegroundLoss`'s win to that
+  mismatch; that attribution is **withdrawn**. Dropping the channels is still right on grounds of
+  train/inference honesty and model size, but it is not what produces the gap.
+* **`VarianceMetricsLoss` is the expensive term here.** Adding it to the foreground arm
+  (`foreground` → `foreground_varloss`) cost more than any confetti manipulation: 32 → 60 blobs,
+  median 18.0 → 8.8, coverage 58.5% → 36.6%.
+
+Holding everything else fixed, the confetti prob-head loss versus brightness
+(`confetti_novarin` vs `foreground_varloss`) is a wash rather than a win for either: fewer and
+larger blobs for brightness (60 / 8.8 vs 83 / 3.8), slightly better cell-material coverage for
+confetti (42.5% vs 36.6%). Consistent with the two targets being r = 0.9986 identical.
+
+**So the best configuration on this data is the simplest one: `ForegroundLoss` +
+`TemporalMetricsLoss`, with `intensity_weight=0.0` and `variance_weight=0.0`.** No confetti anywhere,
+and one fewer loss than the incumbent.
+
+#### Seed check: the margin is bigger than seed-to-seed variation
+
+A single-seed margin is not a result, and this one is being proposed as the default. Three seeds per
+configuration, same 12 held-out frames — `fg` = ForegroundLoss + Temporal, `conf` = the incumbent
+(ConfettiForegroundLoss + VarianceMetricsLoss + confetti input channels):
+
+| area | | blobs (spread) | median px (spread) | cell-material cov (spread) |
+|---|---|---|---|---|
+| 1% | **fg** | **36** (28–46) | **15.2** (9.2–23.5) | **59.4%** (59.4–59.4) |
+| 1% | conf | 50 (44–55) | 6.6 (4.6–8.3) | 52.8% (46.9–56.1) |
+| 2% | **fg** | **68** (51–82) | **11.8** (7.9–18.7) | **84.2%** (84.1–84.3) |
+| 2% | conf | 99 (97–102) | 3.1 (2.8–3.4) | 78.6% (74.8–80.7) |
+| 5% | **fg** | **132** (90–166) | **8.1** (4.2–14.7) | **98.6%** (98.4–98.8) |
+| 5% | conf | 212 (196–224) | 2.0 (1.9–2.0) | 97.2% (96.3–97.8) |
+
+**The median-blob-size ranges do not overlap at any operating point**, and coverage is higher for
+`fg` at all three. Two honest caveats: `fg` is markedly *less stable* across seeds on median blob
+size (9.2–23.5 vs 4.6–8.3 at 1% area), and blob-count spreads do touch at 1% (46 vs 44). Both
+argue for re-checking on the full 16-bit set rather than treating these absolute numbers as final —
+this is one crop, 3 z-planes, 30 epochs.
+
+#### `prob_blur_sigma` becomes a choice rather than a repair
+
+`prob_blur_sigma` exists because the prob head sat on a 1–3 px speckle floor that a threshold cannot
+separate from cells. Supervising the target at cell scale removes most of that floor at source, so
+the blur is no longer fixing a defect — it is trading blob count against blob size from an already
+clean starting point. Same 12 held-out frames, at 1% foreground area:
+
+| `prob_blur_sigma` | `ForegroundLoss`: blobs / median | `ConfettiForegroundLoss`: blobs / median |
+|---|---|---|
+| 0.0 | **32 / 18.0 px** | 66 / **1.9 px** |
+| 1.0 | 21 / 36.2 px | 21 / 31.5 px |
+| 3.0 | 13 / 91.0 px | 12 / 82.3 px |
+
+The confetti arm *needs* the blur to reach a cell-shaped map at all (1.9 → 31.5 px from σ=1 alone);
+the foreground arm starts at 18 px unblurred. Note the two converge once blurred — more evidence that
+what the blur and the target-side blur do is the same work, applied at different ends of the network.
+Cleaning the target is the better end: it shapes what the model learns instead of smoothing over
+what it got wrong.
+
+### What is genuinely lost without confetti
+
+Only one thing: **boundary supervision**. Nothing in greyscale + flow says "these two touching
+regions are different cells" for the ~24% of real contacts that are co-moving. That is what
+`ConfettiBoundaryLoss` was for, and it needs crowded confetti data (plus the gate fix above) to
+work. Everything else confetti was supplying, brightness at cell scale already supplies.
 
 ## Known issues
 
@@ -374,6 +631,44 @@ bright reporters. See `FAQ.md`.
 - **Recommended (11)**: the 4 `mag_*`, `direction_stability`, `cumulative_mag`, `divergence`,
   `vorticity`, `strain`, `edge_strength`, `cell_boundary_likelihood`.
 - **All (15)**: default (no `selected_keys`).
+
+> **These presets are not backed by a measurement, and the first ablation contradicts them
+> (2026-08-05).** Note also that `metrics_to_tensor(..., selected_keys=...)`, referenced above as the
+> way to apply them, **does not exist** in the codebase — subset the metrics dicts directly.
+>
+> Ablated on `zolIMa/fXgbTl` mem-Tom + `coastal.smooth` (one channel, no confetti;
+> `ForegroundLoss` + `TemporalMetricsLoss`, 30 epochs, seed 42, 12 held-out frames), scored at
+> matched foreground area. `split ratio` = instances ÷ connected components of the same mask, so
+> 1.0 would mean region growing never divided a component:
+>
+> | metric set | ch | mask comps | instances | split ratio | @10% median blob |
+> |---|---|---|---|---|---|
+> | none (image only) | 0 | 110 | 65 | 0.60 | 13.3 px |
+> | **4 magnitudes** | 4 | **85** | 59 | **0.69** | **24.6 px** |
+> | minimum 5 | 5 | 148 | 63 | 0.43 | 4.5 px |
+> | recommended 11 | 11 | 166 | 61 | 0.37 | 2.1 px |
+> | all 15 | 15 | 176 | 58 | 0.33 | 1.7 px |
+>
+> **More metrics gave a more fragmented prob map, and all five arms converged on ~58-65
+> instances.** The metric set barely moved the final count; it moved how much region growing had to
+> undo. Four magnitudes beat both ends — unexplained, and n=1 seed, so treat the ordering as
+> provisional. But "more is better" is not supported, and `All (15)` should not be the default
+> without a measurement.
+>
+> **The split ratio is below 1.0 in every arm**: region growing net-*merges* components and never
+> divides them, so the embeddings are not separating touching cells on this data. Independent of the
+> retracted `crowdgen` finding, and reached on real data — but one image, one seed, and mem-Tom here
+> may simply not have many genuine contacts.
+>
+> Caveat on interpreting the `none` arm: with no metrics there is no `TemporalMetricsLoss`, so its
+> embeddings are unsupervised. That it still reaches 65 instances says more about how little the
+> embedding pathway contributes than about flow specifically. A cleaner test would keep
+> `TemporalMetricsLoss` while removing the metrics from the *input* only, which needs the same
+> input/supervision split that `variance_as_input` gave the confetti channels.
+>
+> Two bugs were fixed to make this ablation runnable at all, both reachable only with an empty
+> metric set: `_contrastive_metric_loss` returned a float instead of a tensor, and
+> `predict_frame` fabricated a zero metric channel when handed none.
 
 The UNet's `in_channels` must match the metric count chosen (plus the frame channel — see the
 data contract in `docs/ARCHITECTURE.md`).

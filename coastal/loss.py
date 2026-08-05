@@ -5,6 +5,173 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _blur_at_cell_scale(x, blur_sigma):
+    """Separable Gaussian, so a per-pixel statistic becomes a blob-shaped one."""
+    if blur_sigma <= 0:
+        return x
+    radius = max(1, int(3 * blur_sigma))
+    coords = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+    k = torch.exp(-(coords ** 2) / (2 * blur_sigma ** 2))
+    k = k / k.sum()
+    x = F.conv2d(x, k.view(1, 1, 1, -1), padding=(0, radius))
+    return F.conv2d(x, k.view(1, 1, -1, 1), padding=(radius, 0))
+
+
+def _blob_target(scalar_map, blur_sigma, norm_percentile):
+    """Turn a [B,1,H,W] per-pixel foreground score into a blob-shaped BCE target in [0,1].
+
+    Shared by `ConfettiForegroundLoss` and `ForegroundLoss`, which differ ONLY in how they derive
+    `scalar_map`. That is not a tidiness choice — it is the measured finding. On real data the two
+    derivations agree to `pearson r >= 0.99` (foreground IoU 96.3% on confetti, 94.1% on
+    co-expressed markers), because these two steps are what carry the signal and the colour term
+    contributes almost nothing. Keeping one implementation makes that structural instead of a
+    coincidence that could drift apart. Measurements: docs/SEGMENTATION.md -> *What confetti
+    actually contributes*.
+
+    Rescale per image by a high PERCENTILE, not the max: with the max, one unusually bright cell
+    sets the scale and every typical cell lands far below the inference prob_threshold, so the
+    model learns a near-empty foreground. That is the diagnosed cause of the first confetti retrain
+    collapsing to 14 labels/frame (see `ConfettiForegroundLoss`). A percentile is insensitive to
+    that single outlier; values above it clamp to 1, which is what a saturated cell should read as.
+
+    p99 measured on real AF-corrected frames (kSUFux/jHMfOI, r0hufV + ag0pAo): the fraction of
+    detected cells whose target clears the 0.4 inference threshold is 21-24% under `max`, 92-93% at
+    p99.5 and 100% at p99, for ~2.5% frame coverage - which matches the actual cell density. Below
+    p98 the target starts claiming background.
+
+    KNOWN LIMITATION — the rescale is purely relative, so it has no way to say "there is nothing
+    here". A frame whose only content is noise on a NONZERO pedestal has that noise stretched to
+    fill [0,1] and is claimed as ~100% foreground: the mirror of the "any objective without a
+    coverage term rewards finding nothing" warning in `ConfettiForegroundLoss`. Pinned by
+    `tests/test_loss_foreground.py::test_a_frame_of_pure_noise_on_a_pedestal_is_claimed_entirely`.
+
+    This does not fire on the real data measured so far, because the background is exactly 0
+    (photon-limited and clipped at import): across fXgbTl (32 z-planes), r0hufV (14) and 3w4IY5 (14)
+    every plane has `p1 == 0`, and a genuinely empty plane has `p99 == 0` too, which already yields
+    an empty target. It was left unguarded deliberately — a relative range cannot separate noise
+    spread from cells (Gaussian noise has a relative p99-p1 range of ~37% of its mean, comparable to
+    a real frame's), so the honest fix is an absolute signal estimate, not a threshold on contrast.
+    Revisit if data with a camera bias offset appears.
+    """
+    target = _blur_at_cell_scale(scalar_map, blur_sigma)
+    # .float(): under AMP the target arrives as float16 and torch.quantile rejects it.
+    flat = target.view(target.size(0), -1).float()
+    hi = torch.quantile(flat, norm_percentile / 100.0, dim=1).view(-1, 1, 1, 1) + 1e-6
+    return torch.clamp(target.float() / hi, 0, 1)
+
+
+def flow_discontinuity(metrics_dict, device=None):
+    """A genuine flow-BOUNDARY signal from the metrics already computed: where does the flow field
+    tear?
+
+    `flow.extract_temporal_metrics` emits a metric named `cell_boundary_likelihood`, but it is
+    `0.30*mag + 0.25*cumulative_mag + 0.25*edge_strength + 0.20*tangential_flow` — a blend of motion
+    MAGNITUDE and image edge strength. It is therefore highest in the *interior* of a fast-moving
+    cell and carries no information about two cells moving differently. Despite the name it is not a
+    boundary prior, and nothing ever trained against it.
+
+    What marks a cell-cell contact is the spatial DISCONTINUITY of the velocity field, not its
+    magnitude. `strain` is the magnitude of the symmetric part of the velocity-gradient tensor and
+    `vorticity` the antisymmetric part, so together they span ||grad v|| — no new flow computation is
+    needed. `divergence` (the trace) is added because two cells pulling apart separate without shear.
+
+    Returns [1, H, W] float in [0, 1], or None when the needed metrics are absent (so a caller with
+    a reduced metric set degrades to the plain brightness target rather than erroring).
+
+    Rationale for connecting this to the prob head at all: measured on 465 real touching
+    different-colour pairs, 75.7% have relative motion above the flow noise floor (median 2.10
+    px/frame against 1.28 px/frame within a cell), so ~3/4 of contacts are in principle separable
+    from flow. See docs/SEGMENTATION.md -> *A real validation set*.
+    """
+    needed = [k for k in ("strain", "vorticity", "divergence") if k in metrics_dict]
+    if not needed:
+        return None
+    parts = []
+    for k in needed:
+        v = metrics_dict[k]
+        t = v if isinstance(v, torch.Tensor) else torch.from_numpy(v)
+        parts.append(t.float().abs())
+    d = torch.stack(parts, 0).sum(0)
+    hi = torch.quantile(d.flatten(), 0.99) + 1e-6
+    d = torch.clamp(d / hi, 0, 1)
+    return d.unsqueeze(0).to(device) if device is not None else d.unsqueeze(0)
+
+
+class ForegroundLoss(nn.Module):
+    """Probability guidance from brightness at cell scale. No colour, no markers, no labels.
+
+    The colour-blind form of `ConfettiForegroundLoss`, and the one to use on data that is not
+    confetti. Target: per-pixel brightness (max over the input channels), blurred to cell scale,
+    normalised by a high percentile — i.e. `_blob_target` applied to brightness rather than to
+    dominant-colour confidence.
+
+    **Why this exists: the colour term in `ConfettiForegroundLoss` was measured to do essentially
+    nothing, even on real confetti.** Its target is `max_c softmax_ch_c`, and
+    `flow.compute_variance_metrics` builds `softmax_ch_c` as a cross-channel softmax at
+    `temp=0.3` over Gaussian-pooled (`pool_radius=5`) intensities, then rescales **each channel
+    independently** with `normalize_metric`. Two consequences, both measured on
+    `ccidDriftCorrected` mid-z, 6 frames:
+
+    * The dominance share is pinned near its `1/C` floor. In the foreground on real confetti
+      (kSUFux/r0hufV, C=3, floor 0.333): p5 0.356, median 0.397, p95 0.528, and **0% of
+      foreground pixels are unambiguously one colour** (dominance > 0.8). So the factor the target
+      multiplies brightness by is near-constant.
+    * The per-channel `normalize_metric` then undoes the cross-channel comparability the softmax
+      established, so the max is over independently-stretched maps.
+
+    Net effect: this loss and `ConfettiForegroundLoss` produce the same target to
+    `r = 0.9993` on confetti (foreground IoU 96.3%), `r = 0.9986` on co-expressed markers
+    (IoU 94.1%), `r = 0.9906` on two-cell-type data (IoU 83.0%). The reported win of
+    `ConfettiForegroundLoss` over `IntensityLoss` (2834 blobs -> 87, median 36 -> 90 px) is
+    therefore attributable to the cell-scale blur and the p99 rescale, **not** to confetti.
+
+    So this is not a downgrade for non-confetti data — it is the same objective with the
+    inoperative term removed, and it needs no `variance_metrics`, which means no extra input
+    channels and no train/inference mismatch (see `train.train_with_metrics`).
+
+    Multi-marker data is the case that forces the distinction. On `zolIMa/fXgbTl`
+    (SHG / nuc-GFP / mem-Tom / CD169-Kat) the confetti premise "a cell is a region of ONE colour"
+    is simply false: nuc-GFP and mem-Tom label the nucleus and the membrane of the *same* cell, so
+    a correct segmentation spans two colours. Brightness has no such problem.
+
+    Pass `channels=` to `normalize_and_project` to keep structural channels (SHG, THG) out of the
+    projection this reads — they are bright and are not cells.
+    """
+
+    def __init__(self, blur_sigma: float = 1.0, norm_percentile: float = 99.0,
+                 boundary_weight: float = 0.0):
+        super().__init__()
+        self.blur_sigma = blur_sigma
+        self.norm_percentile = norm_percentile
+        self.boundary_weight = boundary_weight
+
+    def forward(self, pred_prob, frame, boundary=None):
+        """
+        Args:
+            pred_prob: [B, 1, H, W] raw model logits (before sigmoid)
+            frame:     [B, C, H, W] intensity image(s); C>1 is reduced by max over channels
+            boundary:  optional [B, 1, H, W] flow-discontinuity map (see
+                       `flow_discontinuity`). Where it is high the foreground target is
+                       suppressed, so the prob map pinches between differently-moving cells.
+                       This is the ONLY path by which optical flow reaches the labels —
+                       see the class docstring.
+        Returns:
+            BCE against the brightness-at-cell-scale target.
+        """
+        bright = frame.float()
+        bright = bright.max(dim=1, keepdim=True).values if bright.size(1) > 1 else bright
+        target = _blob_target(bright, self.blur_sigma, self.norm_percentile)
+        if boundary is not None and self.boundary_weight > 0:
+            # Subtract, not multiply: a multiplicative gate would scale down whole cells wherever
+            # they move at all, which is what `cell_boundary_likelihood` already does wrong (it is
+            # a motion-MAGNITUDE blend, high in the interior of a fast cell). Subtracting a
+            # blob-scaled discontinuity map carves a trough only where the flow field actually
+            # tears, which is what separates two cells sliding past each other.
+            b = _blob_target(boundary.float(), self.blur_sigma, self.norm_percentile)
+            target = torch.clamp(target - self.boundary_weight * b, 0.0, 1.0)
+        return F.binary_cross_entropy_with_logits(pred_prob.float(), target)
+
+
 class ConfettiForegroundLoss(nn.Module):
     """Probability guidance from confetti colour instead of grayscale texture.
 
@@ -66,14 +233,7 @@ class ConfettiForegroundLoss(nn.Module):
 
     def _blur(self, x):
         """Separable Gaussian at cell scale, so the target is blobs not pixels."""
-        if self.blur_sigma <= 0:
-            return x
-        radius = max(1, int(3 * self.blur_sigma))
-        coords = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
-        k = torch.exp(-(coords ** 2) / (2 * self.blur_sigma ** 2))
-        k = k / k.sum()
-        x = F.conv2d(x, k.view(1, 1, 1, -1), padding=(0, radius))
-        return F.conv2d(x, k.view(1, 1, -1, 1), padding=(radius, 0))
+        return _blur_at_cell_scale(x, self.blur_sigma)
 
     def forward(self, pred_prob, variance_metrics):
         """
@@ -94,23 +254,11 @@ class ConfettiForegroundLoss(nn.Module):
                 for v in (m[k] for k in keys)
             ], dim=0)                                   # [C, H, W]
             targets.append(stack.max(dim=0).values)     # dominant-colour confidence
-        target = torch.stack(targets, dim=0).unsqueeze(1)   # [B, 1, H, W]
-        target = self._blur(target)
-        # Rescale per image so cells read as foreground. Normalise by a high PERCENTILE, not the
-        # max: with the max, one unusually bright cell sets the scale and every typical cell lands
-        # far below the inference prob_threshold, so the model learns a near-empty foreground. That
-        # is the diagnosed cause of the first retrain collapsing to 14 labels/frame (see the class
-        # docstring). A percentile is insensitive to that single outlier; values above it clamp
-        # to 1, which is what a saturated cell should read as anyway.
-        #
-        # p99 measured on real AF-corrected frames (kSUFux/jHMfOI, r0hufV + ag0pAo): the fraction
-        # of detected cells whose target clears the 0.4 inference threshold is 21-24% under `max`,
-        # 92-93% at p99.5 and 100% at p99, for ~2.5% frame coverage - which matches the actual
-        # cell density. Below p98 the target starts claiming background.
-        # .float(): under AMP the target arrives as float16 and torch.quantile rejects it.
-        flat = target.view(target.size(0), -1).float()
-        hi = torch.quantile(flat, self.norm_percentile / 100.0, dim=1).view(-1, 1, 1, 1) + 1e-6
-        target = torch.clamp(target.float() / hi, 0, 1)
+        scalar_map = torch.stack(targets, dim=0).unsqueeze(1)   # [B, 1, H, W]
+        # The blur and the percentile rescale are shared with `ForegroundLoss` — see `_blob_target`,
+        # which also records the measurement that the two agree to r >= 0.99, because the
+        # dominant-colour term above is pinned near its 1/C floor on real data.
+        target = _blob_target(scalar_map, self.blur_sigma, self.norm_percentile)
         return F.binary_cross_entropy_with_logits(pred_prob.float(), target)
 
 
@@ -291,7 +439,15 @@ class IntensityLoss(nn.Module):
 def _contrastive_metric_loss(metric_emb, metrics_dict, k_neighbors, margin, max_pixels=5000):
     B, D, H, W = metric_emb.shape
 
-    total_loss = 0.0
+    # A TENSOR, not 0.0: with an empty metrics dict every batch item hits the `continue` below, and a
+    # float initialiser then makes `total_loss / B` a plain float — which the training loop calls
+    # `.item()` on, raising AttributeError. That only happens when there are no metrics at all, i.e.
+    # exactly the flow-ablation case, so it went unnoticed.
+    #
+    # NO `requires_grad=True` here: that makes it a leaf, and the `total_loss += ...` below is then an
+    # in-place write to a leaf requiring grad, which torch refuses. Gradient still flows because the
+    # tensors being added carry it; this initialiser only has to be the right *type*.
+    total_loss = torch.zeros((), device=metric_emb.device)
 
     for b in range(B):
         # Extract metrics for batch b

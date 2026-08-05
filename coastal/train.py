@@ -6,7 +6,9 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 
 from coastal.model import UNetWithEmbeddings
-from coastal.loss import (ConfettiBoundaryLoss, ConfettiForegroundLoss, IntensityLoss,
+from coastal.loss import (ConfettiBoundaryLoss, ConfettiForegroundLoss, ForegroundLoss,
+                          flow_discontinuity,
+                          IntensityLoss,
                           TemporalMetricsLoss, VarianceMetricsLoss, WarpConsistencyLoss)
 from coastal.device import resolve_device
 
@@ -15,7 +17,7 @@ class TemporalDatasetWithAugmentation(Dataset):
     """Dataset with frame + temporal metrics + variance metrics as input."""
 
     def __init__(self, frames, temporal_metrics_norm, variance_metrics_norm=None,
-                 flow_pairs=None):
+                 flow_pairs=None, variance_as_input=True):
         """
         Args:
             frames: [T, H, W] grayscale frames (max/mean projection of multi-channel data)
@@ -24,11 +26,17 @@ class TemporalDatasetWithAugmentation(Dataset):
             flow_pairs: list of T Optional[np.ndarray [H,W,2]] forward flow from frame t to
                         t+1 ([u=x-disp, v=y-disp] in pixels), or None at the last frame.
                         From extract_dense_flow_pairs(). Used for WarpConsistencyLoss.
+            variance_as_input: also concatenate the variance metrics onto the model INPUT
+                        (default True, the historical behaviour). Set False to use them for
+                        supervision only — see `train_with_metrics`, which explains why that is
+                        usually what you want: the production inference path cannot supply them,
+                        so as input channels they are zeros at inference.
         """
         self.frames = frames
         self.temporal_metrics = temporal_metrics_norm
         self.variance_metrics = variance_metrics_norm or [{} for _ in range(len(frames))]
         self.flow_pairs = flow_pairs  # None = warp loss disabled
+        self.variance_as_input = variance_as_input
 
     def __len__(self):
         return len(self.frames)
@@ -54,7 +62,8 @@ class TemporalDatasetWithAugmentation(Dataset):
         v_metrics = self.variance_metrics[idx] if idx < len(self.variance_metrics) else {}
 
         t_stacked = self._stack_metrics(t_metrics, frame.shape[1:])
-        v_stacked = self._stack_metrics(v_metrics, frame.shape[1:])
+        v_stacked = self._stack_metrics(v_metrics, frame.shape[1:]) \
+            if self.variance_as_input else torch.zeros(0, *frame.shape[1:])
         frame_and_metrics = torch.cat([frame, t_stacked, v_stacked], dim=0)
 
         item = {
@@ -84,7 +93,8 @@ class TemporalDatasetWithAugmentation(Dataset):
                 v_next = self.variance_metrics[idx + 1] \
                     if idx + 1 < len(self.variance_metrics) else {}
                 t_next_s = self._stack_metrics(t_next, frame_next.shape[1:])
-                v_next_s = self._stack_metrics(v_next, frame_next.shape[1:])
+                v_next_s = self._stack_metrics(v_next, frame_next.shape[1:]) \
+                    if self.variance_as_input else torch.zeros(0, *frame_next.shape[1:])
                 item['frame_and_metrics_next'] = torch.cat(
                     [frame_next, t_next_s, v_next_s], dim=0
                 )
@@ -202,7 +212,10 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                        variance_weight=1.0, intensity_weight=1.0, temporal_weight=2.0,
                        warp_weight=0.0, confetti_weight=0.0, confetti_blur_sigma=1.0,
                        boundary_weight=0.0,
+                       foreground_weight=0.0, foreground_blur_sigma=1.0,
+                       foreground_boundary_weight=0.0,
                        flow_pairs=None,
+                       variance_as_input=True,
                        max_grad_norm=1.0, variance_window_size=32, variance_dropout_p=0.5,
                        num_workers=4, use_amp=True):
     """
@@ -222,6 +235,31 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                           per-pixel intensity threshold and half two edge detectors, so it
                           trains the prob head toward speckle — measured 2535 components
                           per frame, median 3 px. Turn it down when using confetti_weight.
+        variance_as_input: concatenate the variance (confetti) metrics onto the model INPUT as well
+                          as handing them to the losses (default True = historical behaviour).
+                          **Prefer False.** The production inference path cannot supply them —
+                          `TwoPassSegmentationInference.predict_frame` takes no `variance_metrics`
+                          argument at all, and `LearnedAffinityInference` zero-fills any channel the
+                          model expects beyond what was passed — so as input channels they are zeros
+                          at inference while training sees them present 50% of the time per channel
+                          (`variance_dropout_p`, applied as a plain mask with no inverted-dropout
+                          rescale). All three zero at once is a 12.5% corner of the training
+                          distribution but 100% of inference. Setting this False keeps confetti as
+                          *supervision only*, which is all `ConfettiForegroundLoss`,
+                          `ConfettiBoundaryLoss` and `VarianceMetricsLoss` need — they read
+                          `variance_metrics_norm` directly. Measured cost of the mismatch on
+                          zolIMa/fXgbTl: see docs/SEGMENTATION.md -> *What confetti actually
+                          contributes*.
+        foreground_weight: weight for ForegroundLoss (default 0.0 = off). The no-confetti prob-head
+                          supervisor: brightness blurred to cell scale and p99-normalised. Use this
+                          instead of confetti_weight on any data that is not confetti, and prefer it
+                          to intensity_weight in general — it supplies the cell-scale shape prior
+                          that IntensityLoss lacks. It needs no variance_metrics_norm, so the model
+                          is built with no confetti input channels and there is no train/inference
+                          mismatch. Measured to produce the same target as ConfettiForegroundLoss to
+                          r >= 0.99 even ON confetti; see loss.ForegroundLoss.
+        foreground_blur_sigma: cell-scale blur for that target (default 1.0 px), same dial as
+                          confetti_blur_sigma.
         confetti_weight:  weight for ConfettiForegroundLoss (default 0.0 = off). Supervises
                           the prob head with "one confetti colour dominates here, brightly",
                           blurred to cell scale, instead of grayscale texture. Needs
@@ -253,7 +291,10 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     use_amp = use_amp and device != 'cpu' and torch.cuda.is_available()
 
     n_temporal = len(next(iter(temporal_metrics_norm), {}))
-    n_variance = len(next(iter(variance_metrics_norm), {})) if use_variance else 0
+    # `n_variance` is how many variance channels reach the model INPUT; the losses read
+    # `variance_metrics_norm` directly and are unaffected by variance_as_input.
+    n_variance = (len(next(iter(variance_metrics_norm), {}))
+                  if use_variance and variance_as_input else 0)
     input_channels = 1 + n_temporal + n_variance
 
     print(f"\n{'='*80}")
@@ -261,7 +302,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     # optimised (the header used to omit the confetti term entirely).
     active = [n for n, w in (('INTENSITY', intensity_weight), ('TEMPORAL', temporal_weight),
                              ('VARIANCE', variance_weight), ('WARP', warp_weight),
-                             ('CONFETTI', confetti_weight),
+                             ('CONFETTI', confetti_weight), ('FOREGROUND', foreground_weight),
                              ('BOUNDARY', boundary_weight)) if w > 0]
     n_losses = len(active)
     print(f"TRAINING: {' + '.join(active)} ({n_losses}-LOSS)")
@@ -269,6 +310,8 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
           f"Variance ({variance_weight}, window={variance_window_size}px, "
           f"dropout_p={variance_dropout_p}) + Warp ({warp_weight}) + "
           f"Confetti ({confetti_weight}, blur={confetti_blur_sigma}px) + "
+          f"Foreground ({foreground_weight}, blur={foreground_blur_sigma}px, "
+          f"flow_boundary={foreground_boundary_weight}) + "
           f"Boundary ({boundary_weight})")
     print(f"Gradient clipping: {max_grad_norm} | AMP: {use_amp} | Workers: {num_workers}")
     print(f"{'='*80}\n")
@@ -276,7 +319,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     dataset = TemporalDatasetWithAugmentation(
         frames_prep, temporal_metrics_norm,
         variance_metrics_norm if use_variance else None,
-        flow_pairs=flow_pairs,
+        flow_pairs=flow_pairs, variance_as_input=variance_as_input,
     )
     def collate_fn(batch):
         out = {
@@ -325,6 +368,9 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     loss_confetti = ConfettiForegroundLoss(blur_sigma=confetti_blur_sigma).to(device) \
         if confetti_weight > 0.0 else None
     loss_boundary = ConfettiBoundaryLoss().to(device) if boundary_weight > 0.0 else None
+    loss_foreground = ForegroundLoss(blur_sigma=foreground_blur_sigma,
+                                     boundary_weight=foreground_boundary_weight).to(device) \
+        if foreground_weight > 0.0 else None
     loss_temporal = TemporalMetricsLoss().to(device)
     loss_variance = VarianceMetricsLoss(window_size=variance_window_size).to(device)
     loss_warp = WarpConsistencyLoss().to(device) if warp_weight > 0.0 else None
@@ -339,6 +385,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
         'temporal': [],
         'warp': [],
         'confetti': [],
+        'foreground': [],
         'boundary': [],
     }
 
@@ -351,6 +398,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             'temporal': 0.0,
             'warp': 0.0,
             'confetti': 0.0,
+            'foreground': 0.0,
             'boundary': 0.0,
         }
 
@@ -384,6 +432,17 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                     else torch.tensor(0.0, device=device)
                 l_boundary = loss_boundary(metric_emb, v_metrics) \
                     if loss_boundary is not None else torch.tensor(0.0, device=device)
+                # `channels` is the projected frame, so this needs no variance metrics at all.
+                # The boundary term is the ONE path by which optical flow reaches the labels:
+                # without it the prob head is supervised by brightness alone and flow only ever
+                # entered as unsupervised input channels. See loss.flow_discontinuity.
+                fg_boundary = None
+                if loss_foreground is not None and foreground_boundary_weight > 0:
+                    bs = [flow_discontinuity(m, device=device) for m in t_metrics]
+                    if all(b is not None for b in bs):
+                        fg_boundary = torch.stack(bs, dim=0)
+                l_foreground = loss_foreground(pred_prob, channels, fg_boundary) \
+                    if loss_foreground is not None else torch.tensor(0.0, device=device)
                 l_temporal = loss_temporal(metric_emb, t_metrics)
                 l_variance = loss_variance(metric_emb, v_metrics, frame_indices=frame_indices) if use_variance else \
                     torch.tensor(0.0, device=device)
@@ -406,6 +465,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                              variance_weight * l_variance +
                              warp_weight * l_warp +
                              confetti_weight * l_confetti +
+                             foreground_weight * l_foreground +
                              boundary_weight * l_boundary)
 
             optimizer.zero_grad()
@@ -424,6 +484,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             epoch_losses['temporal'] += l_temporal.item()
             epoch_losses['warp'] += l_warp.item()
             epoch_losses['confetti'] += l_confetti.item()
+            epoch_losses['foreground'] += l_foreground.item()
             epoch_losses['boundary'] += l_boundary.item()
 
         n = len(dataloader)
@@ -434,19 +495,30 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
         if (epoch + 1) % 10 == 0 or epoch == 0:
             warp_str = f" | warp={epoch_losses['warp']:.4f}" if warp_weight > 0 else ""
             conf_str = f" | conf={epoch_losses['confetti']:.4f}" if confetti_weight > 0 else ""
+            fg_str = f" | fg={epoch_losses['foreground']:.4f}" if foreground_weight > 0 else ""
             bnd_str = f" | bnd={epoch_losses['boundary']:.4f}" if boundary_weight > 0 else ""
             print(f"Epoch {epoch+1:3d}/{num_epochs}: "
                   f"total={epoch_losses['total']:.4f} | "
                   f"int={epoch_losses['intensity']:.4f} | "
                   f"tmp={epoch_losses['temporal']:.4f} | "
                   f"var={epoch_losses['variance']:.4f}"
-                  + warp_str + conf_str + bnd_str)
+                  + warp_str + conf_str + fg_str + bnd_str)
 
+    # Report every ACTIVE term. `intensity` is printed unconditionally above and is computed even at
+    # weight 0, so a run with intensity_weight=0 shows a nonzero `int=` that contributes nothing to
+    # `total` — read the weights in the header, not these numbers, to know what was optimised.
     print(f"\nFinal losses:")
     print(f"  Total:     {history['total'][-1]:.4f}")
-    print(f"  Intensity: {history['intensity'][-1]:.4f}")
+    print(f"  Intensity: {history['intensity'][-1]:.4f}"
+          f"{'' if intensity_weight > 0 else '   (weight 0 — not optimised)'}")
     print(f"  Temporal:  {history['temporal'][-1]:.4f}")
     print(f"  Variance:  {history['variance'][-1]:.4f}")
+    if foreground_weight > 0:
+        print(f"  Foreground:{history['foreground'][-1]:.4f}")
+    if confetti_weight > 0:
+        print(f"  Confetti:  {history['confetti'][-1]:.4f}")
+    if boundary_weight > 0:
+        print(f"  Boundary:  {history['boundary'][-1]:.4f}")
     if warp_weight > 0:
         print(f"  Warp:      {history['warp'][-1]:.4f}")
     print()

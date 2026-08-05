@@ -250,7 +250,11 @@ class LearnedAffinityInference:
         if metric_list:
             metrics_stacked = torch.stack(metric_list, dim=0).unsqueeze(0)
         else:
-            metrics_stacked = torch.zeros(1, 1, H, W)
+            # ZERO channels, not one. A `torch.zeros(1, 1, H, W)` here fabricates a metric plane
+            # that the model never had, so a model trained with no flow metrics at all (in_channels=1
+            # — a flow ablation) is handed 2 channels and the first conv raises. The zero-fill below
+            # is the only thing allowed to add channels, and it is driven by `model.num_metrics`.
+            metrics_stacked = torch.zeros(1, 0, H, W)
 
         # Zero-fill whatever the model expects beyond what was supplied.
         n_variance = max(0, self.model.num_metrics - len(metric_list))

@@ -20,7 +20,11 @@ See also:
   array-shape data contracts between stages, and the cecelia integration seam.
 - [`docs/SEGMENTATION.md`](docs/SEGMENTATION.md) — the segmentation subsystem: flow metrics →
   UNet (prob + embeddings) → 2-loss training → two-pass inference → 3D IOU stitching. Known
-  issues (Y-cell splitting, oversegmentation) and default best parameters.
+  issues (Y-cell splitting, oversegmentation) and default best parameters. Read *What confetti
+  actually contributes* before using any confetti term: three of its four roles were measured to do
+  no work, the prob head is supervised by `ForegroundLoss` (brightness at cell scale) with or
+  without confetti, and confetti input channels are zeros at inference unless you pass
+  `variance_as_input=False`.
 - [`docs/TRACKING.md`](docs/TRACKING.md) — the tracking subsystem: Kalman + LAP assignment, the
   optional cost terms, scoring (`continuity`/`switch_rate`), and the current design state.
   Points to `TRACKING_SESSION_SUMMARY.md` for the running experiment log.
@@ -30,6 +34,10 @@ See also:
   segmentation and tracking (`optimize.py`): param names, bounds, objective functions.
 - [`docs/DATA.md`](docs/DATA.md) — data format, the `prepare_data_for_unet` contract, array
   conventions, and how coastal takes input from / returns output to cecelia.
+- [`docs/SMOOTHING.md`](docs/SMOOTHING.md) — `coastal.smooth`: model-free input smoothing for
+  **photon-limited** movies (Gaussian in space, running median in time, one shared kernel per
+  channel). Distinct from `coastal.denoise`, which is the learned Cellpose-3 restoration + the
+  ratio-preserving gain. Read it before touching either — the split is deliberate.
 - [`docs/JULIA_PORT.md`](docs/JULIA_PORT.md) — Julia portability assessment: per-module status,
   the two hard blockers (Torch stack, Farneback flow), the watch list of Julia drop-ins, and
   the "port into cecelia" strategic angle. Modelled on cecelia's `julia-port-watchlist.md`.
@@ -57,6 +65,7 @@ See also:
 | Polygon/HMM morphology | `docs/MORPHOLOGY.md` |
 | CMA-ES param tuning (names, bounds, objectives) | `docs/OPTIMIZATION.md` |
 | Input/output format, `prepare_data_for_unet`, cecelia integration | `docs/DATA.md` |
+| Model-free smoothing (`smooth.py`): kernels, ordering, the shared-kernel invariant | `docs/SMOOTHING.md` |
 | Julia-portability status of any component | `docs/JULIA_PORT.md` |
 | Deferring a known-better approach | `docs/FUTURE.md` |
 | Removing a tried-and-failed approach (dead end) | `docs/DEAD_ENDS.md` |

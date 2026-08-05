@@ -42,9 +42,12 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.ndimage import gaussian_filter, uniform_filter1d
+# (scipy filters moved out with the restorers — see `coastal.smooth`)
 
 from coastal.device import resolve_device
+from coastal.smooth import (  # re-exported: model-free restorers now live in `smooth`
+    gaussian_restorer, temporal_mean_restorer, temporal_median_restorer,
+)
 
 # --- pretrained weights -----------------------------------------------------------------------
 # Cellpose 3 restoration models. Weights are downloaded from cellpose.org on first use and cached.
@@ -482,44 +485,10 @@ def ratio_preserving_gain(arr, restored, channels=None, channel_axis=0, cap=GAIN
     return np.moveaxis(out, 0, channel_axis)
 
 
-def gaussian_restorer(sigma=1.0):
-    """Spatial restorer: a plane-wise Gaussian. No weights, no download, no net. The default,
-    because it is the only one valid for *any* input shape — see ``temporal_mean_restorer`` for
-    what to use when the leading axis really is time.
-
-    Chosen on measurement, not on principle. Ablating restorers inside the gain wrapper (4 movies
-    x 2 z-planes, recall against raw-grey seeds): raw 84.5% recall / 596 blobs, ``sigma=1``
-    87.5% / 158, ``denoise_cyto3`` 88.2% / 138. The Cellpose net wins by 0.7pp — not enough to
-    make a weights download and a vendored CPnet the default path for confetti data, which is
-    what this whole exercise was trying to get away from.
-    """
-    def restore(proj):
-        sig = (0,) * (proj.ndim - 2) + (sigma, sigma)
-        return gaussian_filter(proj, sigma=sig)
-    return restore
-
-
-def temporal_mean_restorer(window=3):
-    """Temporal restorer: a running mean along axis 0. **The best measured option for movies.**
-
-    Requires the leading axis of the projection to be TIME. Not the default only because
-    :func:`denoise_preserving_ratio` also accepts single timepoints, where this is meaningless.
-
-    At matched foreground area (4 movies x 2 z-planes x 3 frames) it beats every spatial option:
-    raw 83.9% recall at 3% area, ``gaussian_restorer(1)`` 89.3%, ``temporal_mean_restorer(3)``
-    **92.3%**. Wrapped in the gain, identity stays at 99.5% against 97.6% for averaging the
-    channels directly — the same segmentation, 1.9pp more identity, for free.
-
-    Note the window is small on purpose. Motion-compensating the frames first (warping them into
-    alignment before averaging) scores *worse* here, not better — 87.4% at 3% area — because this
-    segmenter is flow-supervised, and alignment deletes the inter-frame motion the UNet is
-    conditioned on. See docs/todo/DENOISE_PLAN.md -> B2.
-    """
-    def restore(proj):
-        if proj.ndim < 3:
-            raise ValueError("temporal_mean_restorer needs a time axis; got a single plane")
-        return uniform_filter1d(proj.astype(np.float32), size=window, axis=0, mode="nearest")
-    return restore
+# `gaussian_restorer` / `temporal_mean_restorer` / `temporal_median_restorer` MOVED to
+# `coastal.smooth` — they are model-free smoothing, and keeping them beside the net was what let
+# three different operations converge on the word "denoise". Re-exported at the bottom of this
+# module, so `from coastal.denoise import gaussian_restorer` keeps working.
 
 
 def cellpose_restorer(model="denoise_cyto3", device=None, diameter=None, batch_size=8,

@@ -182,11 +182,26 @@ def test_denoise_still_re_exports_the_restorers():
 
 def test_smoothing_makes_a_background_findable_on_photon_limited_input():
     """The measured reason this exists: on sparse counts a triangle threshold lands inside the
-    signal. Smoothing gives the histogram a background population to find."""
-    from cecelia.utils import intensity_utils as iu
+    signal, so background subtraction discards most of the cell. Smoothing gives the histogram a
+    background population to find.
+
+    Uses skimage's `threshold_triangle` rather than cecelia's `intensity_utils.background_threshold`:
+    same algorithm (Zack 1977), but scikit-image is a coastal RUNTIME dep while cecelia is not —
+    `coastal/` stays array-only, and cecelia is an optional extra for the notebook/napari glue only.
+    Importing it here passed locally (editable install) and failed CI, which is the point of the
+    boundary.
+
+    Thresholding the NONZERO voxels is what makes this reproduce cecelia's behaviour, and it is the
+    mechanism rather than a detail: `background_threshold(..., ignore_zero=True)` drops the zero bin,
+    because otherwise the histogram's peak IS the zero spike and triangle returns a threshold near 0
+    (measured on this fixture: 88% of cell signal "kept", i.e. the test passes vacuously). With zeros
+    excluded the peak sits in the real background population, the threshold rises into the signal,
+    and the failure this module exists to fix appears.
+    """
+    from skimage.filters import threshold_triangle
     rng = np.random.default_rng(3)
     # Photon counts TIMES A DIGITISER GAIN — the gain matters: without it the smoothed values sit
-    # below 1 and an integer-binned histogram collapses them all into bin 0, which is an artefact of
+    # below 1 and any integer-binned histogram collapses them into one bin, which is an artefact of
     # the fixture rather than of the data. Real `fXgbTl`: 86-95% zeros per channel, max 522, and the
     # cell interior is itself sparse (p99 = 35), which is why raw fails here too.
     gain = 18
@@ -196,10 +211,12 @@ def test_smoothing_makes_a_background_findable_on_photon_limited_input():
     sm = smooth_channels(a, sigma=1.0, frames=3, channel_axis=1, time_axis=0)
 
     def kept(v):
-        h = np.bincount(np.clip(np.rint(v.ravel()), 0, 65535).astype(np.int64), minlength=65536)
-        bg = float(iu.background_threshold(h.astype(float), "triangle"))
-        return 100.0 * (v[:, 0, :, 22:32, 22:32] > bg).mean()
+        bg = float(threshold_triangle(v[v > 0]))       # == ignore_zero=True
+        return 100.0 * (v[:, 0, :, 22:32, 22:32] > bg).mean(), bg
 
-    raw_kept, sm_kept = kept(a), kept(sm)
-    # measured on this fixture: 63.0% -> 100.0%, background threshold 19 -> 6
-    assert sm_kept > raw_kept + 20.0, f"smoothing must recover signal: {raw_kept:.1f}% -> {sm_kept:.1f}%"
+    raw_kept, raw_bg = kept(a)
+    sm_kept, sm_bg = kept(sm)
+    # measured on this fixture: 63.0% (bg 18.8) -> 100.0% (bg 5.4)
+    assert sm_kept > raw_kept + 20.0, (
+        f"smoothing must recover signal: {raw_kept:.1f}% (bg {raw_bg:.1f}) -> "
+        f"{sm_kept:.1f}% (bg {sm_bg:.1f})")

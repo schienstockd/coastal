@@ -52,12 +52,10 @@ def compute_cell_flows(
         )
     T, Z = frames.shape[:2]
 
-    def _to_uint8(frame: np.ndarray) -> np.ndarray:
-        f = np.asarray(frame, dtype=np.float32)
-        mn, mx = f.min(), f.max()
-        if mx - mn < 1e-8:
-            return np.zeros_like(f, dtype=np.uint8)
-        return ((f - mn) / (mx - mn) * 255).astype(np.uint8)
+    # float32, not a per-frame uint8 rescale. Farneback takes float32 directly, and rescaling each
+    # frame of a pair by its OWN min/max broke brightness constancy — the assumption the method
+    # rests on: identical structure at a different frame-wise range reads as motion.
+    frames = np.asarray(frames, dtype=np.float32)
 
     def _process_t(t):
         # Forward flow: from frame t to frame t+1, keyed by instances_4d[t] IDs.
@@ -79,8 +77,8 @@ def compute_cell_flows(
             if seg_z.max() == 0:
                 continue
             flow_z = cv2.calcOpticalFlowFarneback(
-                _to_uint8(frames[t,     z]),   # source
-                _to_uint8(frames[t + 1, z]),   # target
+                frames[t,     z],   # source
+                frames[t + 1, z],   # target
                 None, 0.5, 4, 15, 3, 5, 1.2,
                 cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
             )  # [H, W, 2]
@@ -143,12 +141,8 @@ def compute_cell_flow_features(
         raise ValueError(f"compute_cell_flow_features expects [T, Z, H, W], got {frames.shape}")
     T, Z, H, W = frames.shape
 
-    def _to_uint8(frame: np.ndarray) -> np.ndarray:
-        f = np.asarray(frame, dtype=np.float32)
-        mn, mx = f.min(), f.max()
-        if mx - mn < 1e-8:
-            return np.zeros_like(f, dtype=np.uint8)
-        return ((f - mn) / (mx - mn) * 255).astype(np.uint8)
+    # float32 passthrough — see the note in compute_cell_flows
+    frames = np.asarray(frames, dtype=np.float32)
 
     def _process_t(t):
         cell_ids = np.unique(instances_4d[t])
@@ -168,8 +162,8 @@ def compute_cell_flow_features(
             if seg_z.max() == 0:
                 continue
             flow_z = cv2.calcOpticalFlowFarneback(
-                _to_uint8(frames[t,     z]),
-                _to_uint8(frames[t + 1, z]),
+                frames[t,     z],
+                frames[t + 1, z],
                 None, 0.5, 4, 15, 3, 5, 1.2,
                 cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
             )  # [H, W, 2]

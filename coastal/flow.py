@@ -51,7 +51,7 @@ def compute_flow_for_frame(i, frames_array, scale, N):
 def compute_multi_scale_optical_flow(frames, scales=[1, 2, 4, 8], n_jobs=-1, verbose=True):
     """Multi-scale Farneback optical flow with parallel processing."""
 
-    frames_array = np.array(frames, dtype=np.uint8)
+    frames_array = np.asarray(frames, dtype=np.float32)
     N = frames_array.shape[0]
     multi_scale_flows = {}
 
@@ -112,7 +112,7 @@ def compute_cumulative_displacement_frame(center_idx, frames_array, window_size)
 def compute_cumulative_displacement(frames, window_size=5, n_jobs=-1, verbose=True):
     """Cumulative displacement with parallel processing."""
 
-    frames_array = np.array(frames, dtype=np.uint8)
+    frames_array = np.asarray(frames, dtype=np.float32)
     N = frames_array.shape[0]
 
     if verbose:
@@ -437,8 +437,14 @@ def normalize_and_project(frames_seq, ch_indices=None, percentile_lo=0.01, perce
                         Required when mixing volumes with different spatial dimensions.
 
     Returns:
-        frames_multi:   [T, C', H, W] uint8, per-channel normalized to [0, 255]
-        frames_proj:    [T, H, W] uint8, mean projection across channels
+        frames_multi:   [T, C', H, W] float32, per-channel normalized to [0, 255]
+        frames_proj:    [T, H, W] float32, mean projection across channels
+
+    The 0-255 RANGE is kept (every downstream consumer and the trained model expect it) but the
+    result is no longer quantised to uint8. OpenCV's Farneback accepts float32 directly -- verified
+    against known shifts on 16-bit intravital data -- so the 8-bit step was a lossy round-trip that
+    bought nothing, and it is where the wrap bug lived. Images are 16-bit now that compression made
+    that cheap; nothing in this package should funnel them through 8 bits.
     """
     # Select channels *before* the float32 conversion: converting all C first and then
     # discarding channels cost a full-movie float32 copy per z-slice. One copy, and it is
@@ -456,13 +462,13 @@ def normalize_and_project(frames_seq, ch_indices=None, percentile_lo=0.01, perce
         hi = np.percentile(ch, percentile_hi)
         frames_norm[:, c] = np.clip((ch - lo) / (hi - lo + 1e-8), 0, 1)
 
-    frames_multi = (frames_norm * 255).astype(np.uint8)
-    frames_proj = (frames_norm.max(axis=1) * 255).astype(np.uint8)
+    frames_multi = (frames_norm * 255).astype(np.float32)
+    frames_proj = (frames_norm.max(axis=1) * 255).astype(np.float32)
 
     if target_size is not None:
         tH, tW = target_size
-        out_multi = np.zeros((T, C, tH, tW), dtype=np.uint8)
-        out_proj = np.zeros((T, tH, tW), dtype=np.uint8)
+        out_multi = np.zeros((T, C, tH, tW), dtype=np.float32)
+        out_proj = np.zeros((T, tH, tW), dtype=np.float32)
         for t in range(T):
             for c in range(C):
                 out_multi[t, c] = cv2.resize(frames_multi[t, c], (tW, tH))
@@ -493,7 +499,7 @@ def prepare_data_for_unet(frames, temporal_scales=[1, 2, 4, 8], cumulative_windo
         print(f"TEMPORAL WINDOWING PIPELINE (FARNEBACK OPTICAL FLOW - STREAMLINED)")
         print(f"{'='*80}\n")
 
-    frames_array = np.array(frames, dtype=np.uint8)
+    frames_array = np.asarray(frames, dtype=np.float32)
 
     if verbose:
         print(f"Input: {len(frames_array)} frames of shape {frames_array[0].shape}")

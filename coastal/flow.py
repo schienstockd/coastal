@@ -531,6 +531,104 @@ def prepare_data_for_unet(frames, temporal_scales=[1, 2, 4, 8], cumulative_windo
     return frames_normalized, multi_scale_flows, cum_flows, metrics
 
 
+def flow_metrics_for_frame(window, center, temporal_scales=[1, 2, 4, 8], cumulative_window=5,
+                           value_range=None):
+    """The metric planes for ONE frame of a window, computing only the flows that frame reads.
+
+    `prepare_data_for_unet` builds every flow in the stack because training consumes every frame.
+    **Tiled inference consumes one.** Reading `extract_temporal_metrics` shows how few it touches:
+
+      * per scale it takes a SINGLE flow — `flows[min(len(flows)-1, max(0, frame_idx-1))]`;
+      * from the cumulative list it takes the one whose `center_frame` matches.
+
+    So on a 17-frame window at scales [1,2,4,8] with `cumulative_window=5`, the frame reads 4
+    multi-scale flows and one cumulative sum (5 consecutive flows) — 9 Farneback calls, where
+    `prepare_data_for_unet` computes 53. That 6x is the dominant cost of a tiled segmentation run,
+    because consecutive timepoints re-read almost the same window: at radius 8, frames t and t+1
+    share 16 of 17.
+
+    Returns `(frame_normalized, metrics)` — the same pair
+    `prepare_data_for_unet(window, ...)` would give as `frames_normalized[center], metrics[center]`,
+    which is asserted elementwise in `tests/test_flow_metrics_for_frame.py`. That equivalence is the
+    whole contract: the metric KEYS and their order are a silent train/inference coupling (see
+    `tests/test_flow_metric_count.py`), so this must not become a second, subtly different
+    definition of the feature set.
+
+    Args:
+        window:            [W, H, W] frames in acquisition order — a window of the movie, NOT the
+                           whole movie. Same photometric scaling as training (see
+                           `normalize_and_project`).
+        center:            index within `window` of the frame to compute metrics for. Need not be
+                           the middle: a window truncated at the start/end of a movie is shorter on
+                           one side, and truncation is deliberate — repeating or mirroring a frame
+                           invents motion that was not imaged.
+        temporal_scales:   frame lags to compute flow over. MUST match the trained model's.
+        cumulative_window: centred window for the cumulative displacement. MUST match the model's.
+        value_range:       `(lo, hi)` for the 0–1 intensity scaling, instead of the window's own
+                           min/max. **Tiled inference should pass this.** Training scales by the
+                           whole movie's min/max, so leaving it to a single tile-window would give
+                           each tile its own photometric scale — the patchiness that
+                           `normaliseToWhole` exists to prevent for cellpose, plus a train/inference
+                           mismatch on the structure-tensor planes, which read the scaled frame
+                           directly. Whole-movie callers can leave it None and get the previous
+                           behaviour.
+
+    A scale with `len(window) <= scale` yields no flow and its `mag_{scale}` plane is silently
+    absent — which shifts every later channel. The caller is responsible for supplying a long
+    enough window; `test_flow_metric_count.py` documents why that is not a warning but a bug.
+    """
+    frames_array = np.asarray(window, dtype=np.float32)
+    N = frames_array.shape[0]
+    if not 0 <= center < N:
+        raise IndexError(f"center {center} outside window of {N} frames")
+
+    # Mirror prepare_data_for_unet: the key is always present, empty when the window is too short,
+    # because extract_temporal_metrics skips an empty list rather than raising.
+    multi_scale_flows = {}
+    for scale in temporal_scales:
+        n_flows = max(0, N - scale)
+        if n_flows == 0:
+            multi_scale_flows[scale] = []
+            continue
+        # the one flow `extract_temporal_metrics` will pick for `center`
+        i = min(n_flows - 1, max(0, center - 1))
+        vx, vy = calc_flow_farneback_between_frames(frames_array[i], frames_array[i + scale])
+        multi_scale_flows[scale] = [{'u': vx, 'v': vy, 'scale': scale,
+                                     'frame_pair': (i, i + scale)}]
+
+    # Cumulative displacement for `center` only. Same summation as
+    # compute_cumulative_displacement_frame, minus its progress printing.
+    win_start = max(0, center - cumulative_window // 2)
+    win_end = min(N, center + cumulative_window // 2 + 1)
+    vx_cum = np.zeros(frames_array.shape[1:], dtype=np.float32)
+    vy_cum = np.zeros(frames_array.shape[1:], dtype=np.float32)
+    for idx in range(win_start, win_end - 1):
+        try:
+            vx, vy = calc_flow_farneback_between_frames(frames_array[idx], frames_array[idx + 1])
+        except Exception:
+            continue
+        vx_cum += vx
+        vy_cum += vy
+    cumulative_flows = [{'u': vx_cum, 'v': vy_cum, 'window_size': cumulative_window,
+                         'center_frame': center}]
+
+    # Same global scaling as prepare_data_for_unet -> TemporalMetrics: over the window, once.
+    lo, hi = (frames_array.min(), frames_array.max()) if value_range is None else value_range
+    frames_normalized = (frames_array - lo) / (hi - lo + 1e-5)
+
+    # What `TemporalMetrics` caches: the scaled stack's own min/max, which for a whole-movie call is
+    # (0, ~1) by construction. With an explicit `value_range` the window occupies only part of that
+    # span, so re-deriving it here would stretch the tile back to full contrast — i.e. silently undo
+    # the global scaling the caller asked for. Use the span the scaling defines instead.
+    frame_range = ((frames_normalized.min(), frames_normalized.max()) if value_range is None
+                   else (0.0, 1.0))
+
+    metrics = extract_temporal_metrics(
+        frames_normalized, multi_scale_flows, cumulative_flows, center, frame_range=frame_range)
+
+    return frames_normalized[center], metrics
+
+
 def extract_dense_flow_pairs(multi_scale_flows: dict, scale: int = 1) -> list:
     """Extract per-frame dense flow arrays from the multi_scale_flows structure.
 

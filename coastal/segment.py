@@ -123,6 +123,7 @@ class LearnedAffinityInference:
                  prob_threshold=0.3,
                  embedding_blur_sigma=1.5,
                  prob_blur_sigma=0.0,
+                 seed_blur_sigma=0.0,
                  max_iter=200,
                  min_component_size=20):
         """
@@ -182,6 +183,12 @@ class LearnedAffinityInference:
                 Pixels below this prob are never grown into.
                 Raise to ignore dim/noisy regions. Default: 0.3
             
+            seed_blur_sigma: gaussian sigma for the SEED map only, leaving the outline sharp.
+                0.0 (default) = seeds come from the same map as the mask, i.e. previous behaviour.
+                Raise it when the prob map fragments each cell into several components: the count
+                has a hard floor at the component count, and blurring `prob_blur_sigma` to fix that
+                rounds the boundary away. Cell-diameter-ish is a sensible start.
+
             embedding_blur_sigma: gaussian blur on embeddings [0.5–2.5]
                 Larger → smoother embeddings, more merging.
                 Smaller → respect fine embedding details. Default: 1.5
@@ -204,6 +211,7 @@ class LearnedAffinityInference:
         
         # Secondary tuning (2)
         self.seed_size = seed_size
+        self.seed_blur_sigma = seed_blur_sigma
         self.min_boundary_pixels = min_boundary_pixels
         self.merge_contact_brightness_threshold = merge_contact_brightness_threshold
         
@@ -282,8 +290,29 @@ class LearnedAffinityInference:
         # This composes with, rather than replaces, cleaning the INPUT — see
         # denoise.denoise_preserving_ratio. Denoised input plus sigma=1 is the best measured
         # combination (77.2% recall at 1% area, 42 blobs). See docs/SEGMENTATION.md.
+        prob_raw = prob_map
         if self.prob_blur_sigma > 0:
             prob_map = gaussian_filter(prob_map, sigma=self.prob_blur_sigma)
+
+        # SEEDING and the OUTLINE want opposite amounts of blur, and until `seed_blur_sigma` they
+        # shared `prob_blur_sigma`.
+        #
+        #   Seeding wants HEAVY blur. Seeds are local maxima of the prob map, and every connected
+        #   component of the thresholded map is GUARANTEED one (below) — so the instance count has
+        #   a hard floor at the component count. On photon-limited intravital data that floor was
+        #   ~64 components against ~30 real cells, and no `seed_size` gets under it: `seed_size`
+        #   only removes surplus seeds WITHIN a component.
+        #
+        #   The outline wants NONE. The same blur that fuses those components also rounds the
+        #   boundary: on zolIMa/fXgbTl mem-TOM, sigma=8 gave the right cell count at solidity 0.97
+        #   and circularity 0.79-0.86 — ellipses drawn near the cells rather than their shape. For
+        #   a cytoplasmic reporter the shape IS the readout.
+        #
+        # So seeds come from `seed_map`, the mask and outline from `prob_map`. Measured on that
+        # data: identical counts (42/31), circularity 0.79 -> 0.54, solidity 0.97 -> 0.87.
+        # Default 0.0 reproduces the previous behaviour exactly (seed_map IS prob_map).
+        seed_map = (gaussian_filter(prob_raw, sigma=self.seed_blur_sigma)
+                    if self.seed_blur_sigma > 0 else prob_map)
 
         H, W, D = emb_np.shape
 
@@ -291,18 +320,28 @@ class LearnedAffinityInference:
         if not binary.any():
             return prob_map, np.zeros((H, W), dtype=np.int32), []
 
-        local_max = maximum_filter(prob_map, size=self.seed_size) == prob_map
-        seeds_binary = local_max & binary
+        seed_binary = seed_map > self.prob_threshold
+        local_max = maximum_filter(seed_map, size=self.seed_size) == seed_map
+        # a seed outside the growth mask can never grow, so intersect with it
+        seeds_binary = local_max & seed_binary & binary
 
-        # Every connected component above prob_threshold must have at least one seed.
-        # Scoped to each component's bounding box: the brightest pixel of a component is
-        # inside its own box, and row-major order within the box preserves the whole-frame
-        # argmax tie-break, so the seed chosen is the same one.
-        components, n_components = ndimage.label(binary)
+        # Every connected component of the SEED map must have at least one seed. Scoped to each
+        # component's bounding box: the brightest pixel of a component is inside its own box, and
+        # row-major order within the box preserves the whole-frame argmax tie-break, so the seed
+        # chosen is the same one.
+        #
+        # Deliberately the seed map's components, not the mask's. When the mask is sharper than the
+        # seed map it breaks into speckle fragments containing no seed — those SHOULD go unlabelled
+        # rather than each being handed its own cell, which is the fragmentation this parameter
+        # exists to stop.
+        components, n_components = ndimage.label(seed_binary)
         for comp_id, sl in enumerate(find_objects(components), start=1):
             comp_mask = components[sl] == comp_id
             if not seeds_binary[sl][comp_mask].any():
-                scored = np.where(comp_mask, prob_map[sl], -1.0)
+                # restrict to the growth mask, else the forced seed is stranded outside it
+                scored = np.where(comp_mask & binary[sl], seed_map[sl], -1.0)
+                if scored.max() < 0:
+                    continue
                 local = np.unravel_index(scored.argmax(), scored.shape)
                 seeds_binary[local[0] + sl[0].start, local[1] + sl[1].start] = True
 
@@ -717,6 +756,7 @@ class TwoPassSegmentationInference:
                  seed_size_large=24,
                  affinity_threshold_large=0.7,
                  embedding_blur_sigma_large=1.5,
+                 seed_blur_sigma_large=0.0,
                  merge_max_distance_large=1.5,
                  merge_affinity_threshold_large=0.65,
                  prob_weight_large=0.3,
@@ -724,12 +764,14 @@ class TwoPassSegmentationInference:
                  seed_size_small=10,
                  affinity_threshold_small=0.4,
                  embedding_blur_sigma_small=1.5,
+                 seed_blur_sigma_small=0.0,
                  merge_max_distance_small=1.5,
                  merge_affinity_threshold_small=0.60,
                  prob_weight_small=0.3,
                  merge_contact_brightness_threshold_small=0.60,
                  max_iter=100,
                  min_component_size=20,
+                 min_component_size_small=None,
                  min_boundary_pixels=1):
         """
         Two-pass inference with different parameters for large and small cells.
@@ -738,6 +780,16 @@ class TwoPassSegmentationInference:
             model: trained UNet model
             device: cuda or cpu
             prob_threshold: probability threshold for both passes
+
+            seed_blur_sigma_large / seed_blur_sigma_small: per-pass `seed_blur_sigma` (see
+                LearnedAffinityInference). The two passes want opposite values on photon-limited
+                data: the large pass needs heavy seed blur to stop one cell fragmenting into
+                several, while the small pass is looking FOR small objects and must not have them
+                blurred together. 0.0 on both = previous behaviour.
+
+            min_component_size_small: size floor for pass 2 only (default: same as
+                `min_component_size`). Apoptotic bodies are legitimately far smaller than a cell,
+                so the floor that suppresses speckle in pass 1 also deletes them in pass 2.
 
             # Pass 1 parameters (large cells)
             seed_size_large: seed window size
@@ -781,6 +833,7 @@ class TwoPassSegmentationInference:
             prob_weight=prob_weight_large,
             merge_contact_brightness_threshold=merge_contact_brightness_threshold_large,
             min_boundary_pixels=min_boundary_pixels,
+            seed_blur_sigma=seed_blur_sigma_large,
         )
 
         self.pass2 = LearnedAffinityInference(
@@ -790,22 +843,35 @@ class TwoPassSegmentationInference:
             seed_size=seed_size_small,
             affinity_threshold=affinity_threshold_small,
             max_iter=max_iter,
-            min_component_size=min_component_size,
+            min_component_size=(min_component_size if min_component_size_small is None
+                                else min_component_size_small),
             embedding_blur_sigma=embedding_blur_sigma_small,
             merge_max_distance=merge_max_distance_small,
             merge_affinity_threshold=merge_affinity_threshold_small,
             prob_weight=prob_weight_small,
             merge_contact_brightness_threshold=merge_contact_brightness_threshold_small,
             min_boundary_pixels=min_boundary_pixels,
+            seed_blur_sigma=seed_blur_sigma_small,
         )
 
-    def predict_frame(self, frame, metrics_dict):
-        """Two-pass segmentation: large cells → small fragments."""
+    def predict_frame(self, frame, metrics_dict, return_provenance=False):
+        """Two-pass segmentation: large cells → small fragments.
+
+        Args:
+            return_provenance: also return a [H, W] uint8 map — 0 background, 1 pass 1 (cells),
+                2 pass 2 (small objects). The merged labels alone cannot answer "which pass found
+                this", and object SIZE is not a substitute: pass 1 can return a small object and
+                pass 2 a larger one. Returned rather than stashed on `self` because the 3D/4D
+                paths call this from several threads on one instance.
+        """
         prob_map, instances_pass1, props1 = self.pass1.predict_frame(frame, metrics_dict)
 
         mask_remaining = (instances_pass1 == 0) & (prob_map > self.prob_threshold)
 
         if not mask_remaining.any():
+            if return_provenance:
+                return (prob_map, instances_pass1, props1,
+                        (instances_pass1 > 0).astype(np.uint8))
             return prob_map, instances_pass1, props1
 
         prob_map_p2, instances_pass2, props2 = self.pass2.predict_frame(frame, metrics_dict)
@@ -818,6 +884,12 @@ class TwoPassSegmentationInference:
         instances_merged[mask_remaining] = instances_pass2[mask_remaining]
 
         props_merged = regionprops(instances_merged)
+
+        if return_provenance:
+            provenance = np.zeros(instances_merged.shape, dtype=np.uint8)
+            provenance[instances_pass1 > 0] = 1
+            provenance[mask_remaining & (instances_pass2 > 0)] = 2
+            return prob_map, instances_merged, props_merged, provenance
 
         return prob_map, instances_merged, props_merged
 

@@ -24,6 +24,23 @@ temporal_scales=[1,2,4,8])` returns the prepped frames + metrics. ~14–16 metri
 set. Farneback runs **CPU-only** (no CUDA OpenCV dep). Parallelised per-frame via joblib. Full
 parameter/selection guide: `QUICK_REFERENCE.txt`.
 
+### One frame of a window — `flow_metrics_for_frame`
+
+`prepare_data_for_unet` computes flows for **every** frame because training consumes every frame.
+A tiled segmentation run consumes **one**: it reads a window around timepoint `t`, segments `t`,
+then moves on — and at scale 8 consecutive windows share 16 of 17 frames. `flow_metrics_for_frame`
+computes only what `extract_temporal_metrics` actually indexes (one flow per scale, plus the
+cumulative sum) — 9 Farneback calls against 53 on a 17-frame window.
+
+It is an optimisation, not a second feature set: `tests/test_flow_metrics_for_frame.py` asserts it
+equals `prepare_data_for_unet(window, ...)` at that frame plane-for-plane, at every position
+including the truncated ends. That equality is load-bearing, because the metric keys are a silent
+train/inference coupling (see *Known issues* and `tests/test_flow_metric_count.py`).
+
+Pass `value_range=(lo, hi)` when tiling. Training scales intensities by the whole movie's min/max;
+without the override each tile-window gets its own scale, so the same frame changes contrast
+depending on which window read it — and the structure-tensor planes read the scaled frame directly.
+
 ## 2. Model (`model.py`)
 
 `UNetWithEmbeddings` — a UNet with two heads:

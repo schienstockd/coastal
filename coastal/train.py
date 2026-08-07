@@ -217,7 +217,7 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                        flow_pairs=None,
                        val_frames=None, val_temporal_metrics_norm=None,
                        val_variance_metrics_norm=None, val_flow_pairs=None,
-                       variance_as_input=True,
+                       variance_as_input=True, on_epoch=None,
                        max_grad_norm=1.0, variance_window_size=32, variance_dropout_p=0.5,
                        num_workers=4, use_amp=True):
     """
@@ -558,6 +558,14 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             torch.set_rng_state(rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state_all(cuda_rng_state)
+
+        # Progress out, per epoch. Training is by far the longest phase of a run and it emits nothing
+        # a caller can act on — the prints below are for a human reading a notebook and only fire
+        # every tenth epoch, so an application driving this has no way to show a bar and the run
+        # looks hung for as long as it takes. Losses go with it because a caller showing progress
+        # generally wants to show what it converged to as well.
+        if on_epoch is not None:
+            on_epoch(epoch + 1, num_epochs, dict(epoch_losses))
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             warp_str = f" | warp={epoch_losses['warp']:.4f}" if warp_weight > 0 else ""

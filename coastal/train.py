@@ -215,6 +215,8 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                        foreground_weight=0.0, foreground_blur_sigma=1.0,
                        foreground_boundary_weight=0.0,
                        flow_pairs=None,
+                       val_frames=None, val_temporal_metrics_norm=None,
+                       val_variance_metrics_norm=None, val_flow_pairs=None,
                        variance_as_input=True,
                        max_grad_norm=1.0, variance_window_size=32, variance_dropout_p=0.5,
                        num_workers=4, use_amp=True):
@@ -225,6 +227,16 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
         frames_prep: [T, H, W] or [T, C, H, W] training frames
         temporal_metrics_norm: list of T dicts (optical flow metrics)
         variance_metrics_norm: list of T dicts (cross-channel variance metrics), or None
+        val_frames / val_temporal_metrics_norm / val_variance_metrics_norm / val_flow_pairs:
+                          a HELD-OUT split, in the same shapes as the training ones. When given,
+                          every term is also evaluated on it once per epoch (no grad, no
+                          augmentation) and recorded as `val_*` in the history. Split with
+                          `train_test_split_per_movie`, which splits WITHIN each movie so both
+                          sides see every movie. Without this a loss curve cannot distinguish
+                          convergence from memorising — it only ever says the number went down.
+                          `val_flow_pairs` matters whenever `warp_weight > 0`: leave it out and
+                          the warp term is zero on the held-out set, which drags `val_total`
+                          below `total` for a reason that is not generalisation.
         num_epochs: training epochs
         batch_size: batch size
         seed: random seed
@@ -281,7 +293,8 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
         use_amp: enable automatic mixed precision (float16) on CUDA for faster training (default True)
 
     Returns:
-        model, history
+        model, history — `history[term]` per epoch, plus `history['val_' + term]` when a
+        validation split was supplied.
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -353,6 +366,35 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
         pin_memory=(device != 'cpu'),
     )
 
+    # Same dataset class, same collate, same batch size — shuffle off, because a validation pass has
+    # no reason to reorder and a stable order makes two runs comparable.
+    val_loader = None
+    if val_frames is not None and val_temporal_metrics_norm is not None and len(val_frames):
+        val_dataset = TemporalDatasetWithAugmentation(
+            val_frames, val_temporal_metrics_norm,
+            val_variance_metrics_norm if use_variance else None,
+            flow_pairs=val_flow_pairs, variance_as_input=variance_as_input,
+        )
+        # `num_workers=0` deliberately, where the training loader uses `num_workers`. Inheriting it
+        # would keep a SECOND persistent worker pool alive for the whole run — doubling the worker
+        # processes, each holding its own copy of the frames and metrics, to serve a set that is
+        # typically a fifth the size and read forward-only once per epoch. The main thread can
+        # prepare that; a duplicated dataset in memory is the kind of cost that only shows up on the
+        # box with the big movies on it.
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn,
+            num_workers=0, pin_memory=(device != 'cpu'),
+        )
+        print(f"Validation frames: {len(val_dataset)}")
+        # `val_total` is only comparable with `total` if it is made of the SAME terms. Without flow
+        # pairs the warp term is structurally zero on the held-out set while it is nonzero on the
+        # training set, so `val_total` sits below `total` by `warp_weight * warp` for a reason that
+        # has nothing to do with generalising — which is precisely the reading the val curve exists
+        # to support. Say so rather than let the gap be misread as headroom.
+        if warp_weight > 0 and val_flow_pairs is None:
+            print("  ! no val_flow_pairs: warp is 0 on the held-out set, so val_total is NOT "
+                  "comparable with total — compare the per-term curves instead")
+
     model = UNetWithEmbeddings(
         num_metrics=n_temporal + n_variance,
         num_frames=1,
@@ -378,98 +420,102 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     optimizer = Adam(model.parameters(), lr=1e-4)
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-    history = {
-        'total': [],
-        'variance': [],
-        'intensity': [],
-        'temporal': [],
-        'warp': [],
-        'confetti': [],
-        'foreground': [],
-        'boundary': [],
-    }
+    TERMS = ('total', 'variance', 'intensity', 'temporal', 'warp', 'confetti', 'foreground',
+             'boundary')
+    history = {k: [] for k in TERMS}
+    if val_loader is not None:
+        history.update({f'val_{k}': [] for k in TERMS})
+
+    def batch_losses(batch, training):
+        """Every loss term for one batch, as tensors keyed like `history`.
+
+        ONE implementation, called by the training loop and the validation pass alike. A separate
+        eval-time copy is the classic way for a validation curve to drift from the thing it claims
+        to measure — a term reweighted here and not there, and the two curves stop being comparable
+        while still both going down.
+
+        `training` gates only what must NOT happen at eval: the variance-channel dropout, which is
+        augmentation. Everything else — the terms, the weights, the sum — is identical by
+        construction.
+        """
+        frame_and_metrics = batch['frame_and_metrics'].to(device, non_blocking=True)
+        channels = batch['channels'].to(device, non_blocking=True)
+        v_metrics = batch['variance_metrics']
+        t_metrics = batch['temporal_metrics']
+        frame_indices = batch['frame_idx']
+
+        # Channel dropout on variance input channels so the model learns to
+        # function without them (inference uses zeros in those positions).
+        if training and use_variance and n_variance > 0:
+            B_cur = frame_and_metrics.shape[0]
+            keep = torch.rand(B_cur, n_variance, 1, 1, device=device) > variance_dropout_p
+            frame_and_metrics = frame_and_metrics.clone()
+            frame_and_metrics[:, 1 + n_temporal:] *= keep.float()
+
+        flow_uv_batch = batch.get('flow_uv')
+        fm_next_batch = batch.get('frame_and_metrics_next')
+        warp_mask     = batch.get('warp_mask', [])
+
+        with torch.autocast(device_type='cuda' if use_amp else 'cpu', enabled=use_amp):
+            # One encoder/decoder pass shared by all three losses.
+            decoded = model.encode_decode(frame_and_metrics)
+            pred_prob = model.prob_head(decoded)
+            metric_emb = model.emb_head(decoded)
+
+            l_intensity = loss_intensity(pred_prob, channels)
+            l_confetti = loss_confetti(pred_prob, v_metrics) if loss_confetti is not None \
+                else torch.tensor(0.0, device=device)
+            l_boundary = loss_boundary(metric_emb, v_metrics) \
+                if loss_boundary is not None else torch.tensor(0.0, device=device)
+            # `channels` is the projected frame, so this needs no variance metrics at all.
+            # The boundary term is the ONE path by which optical flow reaches the labels:
+            # without it the prob head is supervised by brightness alone and flow only ever
+            # entered as unsupervised input channels. See loss.flow_discontinuity.
+            fg_boundary = None
+            if loss_foreground is not None and foreground_boundary_weight > 0:
+                bs = [flow_discontinuity(m, device=device) for m in t_metrics]
+                if all(b is not None for b in bs):
+                    fg_boundary = torch.stack(bs, dim=0)
+            l_foreground = loss_foreground(pred_prob, channels, fg_boundary) \
+                if loss_foreground is not None else torch.tensor(0.0, device=device)
+            l_temporal = loss_temporal(metric_emb, t_metrics)
+            l_variance = loss_variance(metric_emb, v_metrics, frame_indices=frame_indices) if use_variance else \
+                torch.tensor(0.0, device=device)
+
+            # Warp consistency: run model on next frame for batch items that have flow
+            l_warp = torch.tensor(0.0, device=device)
+            if loss_warp is not None and flow_uv_batch is not None and any(warp_mask):
+                fm_next = fm_next_batch.to(device, non_blocking=True)
+                flow_uv = flow_uv_batch.to(device, non_blocking=True)
+                # Select the matching rows from frame t embeddings and prob
+                mask_idx = [i for i, m in enumerate(warp_mask) if m]
+                emb_t_sel   = metric_emb[mask_idx]
+                prob_t_sel  = pred_prob[mask_idx]
+                decoded_n   = model.encode_decode(fm_next)
+                emb_t1_sel  = model.emb_head(decoded_n)
+                l_warp = loss_warp(emb_t_sel, emb_t1_sel, flow_uv, prob_t_sel)
+
+            total_loss = (intensity_weight * l_intensity +
+                         temporal_weight * l_temporal +
+                         variance_weight * l_variance +
+                         warp_weight * l_warp +
+                         confetti_weight * l_confetti +
+                         foreground_weight * l_foreground +
+                         boundary_weight * l_boundary)
+
+        return {'total': total_loss, 'intensity': l_intensity, 'temporal': l_temporal,
+                'variance': l_variance, 'warp': l_warp, 'confetti': l_confetti,
+                'foreground': l_foreground, 'boundary': l_boundary}
 
     for epoch in range(num_epochs):
         model.train()
-        epoch_losses = {
-            'total': 0.0,
-            'variance': 0.0,
-            'intensity': 0.0,
-            'temporal': 0.0,
-            'warp': 0.0,
-            'confetti': 0.0,
-            'foreground': 0.0,
-            'boundary': 0.0,
-        }
+        epoch_losses = {k: 0.0 for k in TERMS}
 
         for batch_idx, batch in enumerate(dataloader):
-            frame_and_metrics = batch['frame_and_metrics'].to(device, non_blocking=True)
-            channels = batch['channels'].to(device, non_blocking=True)
-            v_metrics = batch['variance_metrics']
-            t_metrics = batch['temporal_metrics']
-            frame_indices = batch['frame_idx']
-
-            # Channel dropout on variance input channels so the model learns to
-            # function without them (inference uses zeros in those positions).
-            if use_variance and n_variance > 0:
-                B_cur = frame_and_metrics.shape[0]
-                keep = torch.rand(B_cur, n_variance, 1, 1, device=device) > variance_dropout_p
-                frame_and_metrics = frame_and_metrics.clone()
-                frame_and_metrics[:, 1 + n_temporal:] *= keep.float()
-
-            flow_uv_batch = batch.get('flow_uv')
-            fm_next_batch = batch.get('frame_and_metrics_next')
-            warp_mask     = batch.get('warp_mask', [])
-
-            with torch.autocast(device_type='cuda' if use_amp else 'cpu', enabled=use_amp):
-                # One encoder/decoder pass shared by all three losses.
-                decoded = model.encode_decode(frame_and_metrics)
-                pred_prob = model.prob_head(decoded)
-                metric_emb = model.emb_head(decoded)
-
-                l_intensity = loss_intensity(pred_prob, channels)
-                l_confetti = loss_confetti(pred_prob, v_metrics) if loss_confetti is not None \
-                    else torch.tensor(0.0, device=device)
-                l_boundary = loss_boundary(metric_emb, v_metrics) \
-                    if loss_boundary is not None else torch.tensor(0.0, device=device)
-                # `channels` is the projected frame, so this needs no variance metrics at all.
-                # The boundary term is the ONE path by which optical flow reaches the labels:
-                # without it the prob head is supervised by brightness alone and flow only ever
-                # entered as unsupervised input channels. See loss.flow_discontinuity.
-                fg_boundary = None
-                if loss_foreground is not None and foreground_boundary_weight > 0:
-                    bs = [flow_discontinuity(m, device=device) for m in t_metrics]
-                    if all(b is not None for b in bs):
-                        fg_boundary = torch.stack(bs, dim=0)
-                l_foreground = loss_foreground(pred_prob, channels, fg_boundary) \
-                    if loss_foreground is not None else torch.tensor(0.0, device=device)
-                l_temporal = loss_temporal(metric_emb, t_metrics)
-                l_variance = loss_variance(metric_emb, v_metrics, frame_indices=frame_indices) if use_variance else \
-                    torch.tensor(0.0, device=device)
-
-                # Warp consistency: run model on next frame for batch items that have flow
-                l_warp = torch.tensor(0.0, device=device)
-                if loss_warp is not None and flow_uv_batch is not None and any(warp_mask):
-                    fm_next = fm_next_batch.to(device, non_blocking=True)
-                    flow_uv = flow_uv_batch.to(device, non_blocking=True)
-                    # Select the matching rows from frame t embeddings and prob
-                    mask_idx = [i for i, m in enumerate(warp_mask) if m]
-                    emb_t_sel   = metric_emb[mask_idx]
-                    prob_t_sel  = pred_prob[mask_idx]
-                    decoded_n   = model.encode_decode(fm_next)
-                    emb_t1_sel  = model.emb_head(decoded_n)
-                    l_warp = loss_warp(emb_t_sel, emb_t1_sel, flow_uv, prob_t_sel)
-
-                total_loss = (intensity_weight * l_intensity +
-                             temporal_weight * l_temporal +
-                             variance_weight * l_variance +
-                             warp_weight * l_warp +
-                             confetti_weight * l_confetti +
-                             foreground_weight * l_foreground +
-                             boundary_weight * l_boundary)
+            losses = batch_losses(batch, training=True)
 
             optimizer.zero_grad()
-            scaler.scale(total_loss).backward()
+            scaler.scale(losses['total']).backward()
 
             if max_grad_norm > 0:
                 scaler.unscale_(optimizer)
@@ -478,19 +524,40 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             scaler.step(optimizer)
             scaler.update()
 
-            epoch_losses['total'] += total_loss.item()
-            epoch_losses['variance'] += l_variance.item()
-            epoch_losses['intensity'] += l_intensity.item()
-            epoch_losses['temporal'] += l_temporal.item()
-            epoch_losses['warp'] += l_warp.item()
-            epoch_losses['confetti'] += l_confetti.item()
-            epoch_losses['foreground'] += l_foreground.item()
-            epoch_losses['boundary'] += l_boundary.item()
+            for k in TERMS:
+                epoch_losses[k] += losses[k].item()
 
         n = len(dataloader)
-        for key in epoch_losses:
+        for key in TERMS:
             epoch_losses[key] /= n
             history[key].append(epoch_losses[key])
+
+        # Held-out pass. No grad, no augmentation, same terms and the same weights — so `val_total`
+        # is comparable with `total` and the gap between them is the only thing that can tell
+        # convergence from memorising. Without it a loss curve only ever says "it went down".
+        #
+        # The RNG state is snapshotted and put back afterwards, which is not incidental: iterating a
+        # DataLoader draws its base seed from the GLOBAL torch stream, so the validation pass — with
+        # no gradients and no augmentation of its own — would still shift every later shuffle and
+        # every later dropout mask. Turning validation on would then hand you a DIFFERENT model, and
+        # the curve would no longer describe the run you would have had without it. Measuring a run
+        # must not change it.
+        if val_loader is not None:
+            rng_state = torch.get_rng_state()
+            cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            model.eval()
+            val_losses = {k: 0.0 for k in TERMS}
+            with torch.no_grad():
+                for batch in val_loader:
+                    losses = batch_losses(batch, training=False)
+                    for k in TERMS:
+                        val_losses[k] += losses[k].item()
+            nv = max(1, len(val_loader))
+            for key in TERMS:
+                history[f'val_{key}'].append(val_losses[key] / nv)
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             warp_str = f" | warp={epoch_losses['warp']:.4f}" if warp_weight > 0 else ""
@@ -508,7 +575,8 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     # weight 0, so a run with intensity_weight=0 shows a nonzero `int=` that contributes nothing to
     # `total` — read the weights in the header, not these numbers, to know what was optimised.
     print(f"\nFinal losses:")
-    print(f"  Total:     {history['total'][-1]:.4f}")
+    print(f"  Total:     {history['total'][-1]:.4f}"
+          + (f"   (val {history['val_total'][-1]:.4f})" if val_loader is not None else ''))
     print(f"  Intensity: {history['intensity'][-1]:.4f}"
           f"{'' if intensity_weight > 0 else '   (weight 0 — not optimised)'}")
     print(f"  Temporal:  {history['temporal'][-1]:.4f}")

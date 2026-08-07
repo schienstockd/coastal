@@ -89,10 +89,38 @@ handles augmentation. Multi-movie pipeline:
 all_frames, all_metrics = prepare_data_for_unet_batch([movie1, movie2, ...])
 train_frames, test_frames, train_metrics, test_metrics = train_test_split_per_movie(
     all_frames, all_metrics)
-model, history = train_with_metrics(train_frames, train_metrics, num_epochs=50)
+model, history = train_with_metrics(
+    train_frames, train_metrics, num_epochs=50,
+    val_frames=test_frames, val_temporal_metrics_norm=test_metrics)
 ```
 
 `extract_sequences_from_volume` / `prepare_data_for_unet_batch_4d` handle 3D+T volumes.
+
+### The held-out pass — why `val_*` is not optional
+
+A training loss curve cannot tell convergence from memorising. It reports one number, measured on
+the frames the weights were just fitted to, and that number goes down either way. Pass a held-out
+split and every term is also evaluated on it once per epoch — no grad, no augmentation — as
+`history['val_<term>']`. The **gap** between `total` and `val_total` is the reading; the curves
+alone are not.
+
+`train_test_split_per_movie` splits *within* each movie, so both sides see every movie. It splits
+frames plus **one** metrics list, so variance metrics need a second call at the same `train_ratio`
+with `shuffle=False` — that lines the two splits up frame for frame.
+
+Three things make the two curves incomparable while leaving both descending and plausible, so all
+three are closed by construction:
+
+| Trap | What keeps it closed |
+|---|---|
+| A term evaluated differently on the two sides | One `batch_losses(batch, training)`; `training` gates *only* the variance dropout |
+| Augmentation left on at eval | Same flag — the dropout is the only stochastic step, and it is off |
+| A term structurally absent on one side | `val_flow_pairs`. Without it, warp is 0 on the held-out set and `val_total` sits below `total` by `warp_weight * warp` for a reason that is not generalisation. Omitting it while `warp_weight > 0` prints a warning |
+
+The pass also snapshots and restores the RNG. Iterating a `DataLoader` draws its base seed from the
+global torch stream, so a validation loop with no gradients of its own still shifted every later
+shuffle and dropout mask: epoch 1 matched and epoch 2 did not, and turning validation on handed you
+a different model. Measuring a run must not change it (`tests/test_train_validation.py`).
 
 ## 5. Inference (`segment.py`)
 

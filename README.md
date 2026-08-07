@@ -80,8 +80,11 @@ all_frames, all_metrics = coastal.prepare_data_for_unet_batch([movie1, movie2, .
 train_frames, test_frames, train_metrics, test_metrics = coastal.train_test_split_per_movie(
     all_frames, all_metrics)
 
-# 2. Train the UNet (no labels needed).
-model, history = coastal.train_with_metrics(train_frames, train_metrics, num_epochs=50)
+# 2. Train the UNet (no labels needed). Pass the held-out split too — without it the loss
+#    curve cannot tell convergence from memorising (history gains a `val_<term>` per term).
+model, history = coastal.train_with_metrics(
+    train_frames, train_metrics, num_epochs=50,
+    val_frames=test_frames, val_temporal_metrics_norm=test_metrics)
 
 # 3. Segment a sequence (frames_prep + normalised temporal metrics for one movie).
 segmentor = coastal.TwoPassSegmentationInference(

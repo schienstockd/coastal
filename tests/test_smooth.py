@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from coastal.smooth import (
-    spatial_smooth, temporal_smooth, smooth_channels, temporal_gated, gated_frame,
+    spatial_smooth, temporal_smooth, smooth_channels, temporal_gated, gated_frame, gated_frames,
     gaussian_restorer, temporal_mean_restorer, temporal_median_restorer,
 )
 
@@ -343,3 +343,37 @@ def test_an_unshared_sigma_is_what_makes_the_two_forms_differ():
     from coastal.smooth import noise_sigma
     assert noise_sigma(a) != noise_sigma(a[1:6])          # different samples, different estimate
     assert not np.allclose(temporal_gated(a, 5)[3], gated_frame(a[1:6]), rtol=1e-6, atol=1e-6)
+
+
+def test_the_match_is_computed_ONCE_for_all_channels():
+    """The gate depends only on the guide, so N channels must cost ONE match, not N.
+
+    Pinned by counting, because nothing about the OUTPUT would change if this regressed — the answer
+    stays identical and only the runtime moves, which is exactly the kind of regression that survives
+    a green suite. Measured on a real 4-channel plane, per-channel matching was 3.7x slower.
+    """
+    import coastal.smooth as cs
+    rng = np.random.default_rng(9)
+    guide = rng.normal(30, 4, size=(5, 24, 24)).astype(np.float32)
+    windows = [guide * m for m in (1.0, 2.0, 0.5, 3.0)]
+
+    calls = []
+    real = cs._match
+    cs._match = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        out = gated_frames(windows, guide=guide, sigma=2.0)
+    finally:
+        cs._match = real
+    assert len(calls) == 1, f'matched {len(calls)} times for {len(windows)} channels'
+    assert len(out) == len(windows)
+
+
+def test_gated_frames_and_gated_frame_agree():
+    """The multi-channel form is an optimisation, not a different filter."""
+    rng = np.random.default_rng(10)
+    guide = rng.normal(30, 4, size=(5, 20, 20)).astype(np.float32)
+    guide[:, 9, 9] += 60
+    windows = [guide, guide * 2.0]
+    many = gated_frames(windows, guide=guide, sigma=2.0)
+    for w, m in zip(windows, many):
+        np.testing.assert_allclose(gated_frame(w, guide=guide, sigma=2.0), m, rtol=1e-5, atol=1e-3)

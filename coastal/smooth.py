@@ -85,6 +85,7 @@ __all__ = [
     "temporal_median_restorer",
     "temporal_gated",
     "gated_frame",
+    "gated_frames",
     "noise_sigma",
 ]
 
@@ -259,30 +260,60 @@ def noise_sigma(stack, time_axis=0):
     return float(1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2))
 
 
-def _gate_one(target, neighbours, g_target, g_neighbours, scale, search, patch):
-    """Gated average of ONE frame against its neighbours. The core both forms share.
+def _offsets(search):
+    return [(dy, dx) for dy in range(-search, search + 1) for dx in range(-search, search + 1)]
 
-    `target`/`g_target` are (Y, X); `neighbours`/`g_neighbours` are sequences of (Y, X). The match and
-    the weight are computed on the `g_*` guide and applied to the data — that separation is what lets
-    several channels be gated identically (see `smooth_channels`).
+
+def _match(g_target, g_neighbours, scale, search, patch):
+    """The gate itself: per neighbour, where each patch WENT and how much to trust it.
+
+    Computed from the guide ALONE, and returned rather than applied, because it does not depend on the
+    channel — several channels share one gate, so the match must be computed once and reused. Doing it
+    per channel is the same answer C times over, and the block match is the expensive part (a
+    `uniform_filter` per candidate offset, against a cheap `np.roll` to apply one).
+
+    Returns a list of `(weight, take)` pairs, one per neighbour. `take` is a FLAT index array: the
+    matched value for a neighbour is `nb.ravel()[take]`, i.e. one gather. Resolving the winning offset
+    to an index here rather than in the apply step matters — the alternative is re-rolling the whole
+    plane once per candidate offset for every channel, which is the same work again per channel.
     """
-    acc = target.astype(np.float32).copy()             # the current frame always carries weight 1
+    H, W = g_target.shape
+    yy, xx = np.indices((H, W), dtype=np.int32)   # int32: 4 GB of pixels per plane before it overflows,
+                                                 # and halves the index array a big plane carries
+    out = []
+    for g_nb in g_neighbours:
+        best_d = np.full(g_target.shape, np.inf, dtype=np.float32)
+        take = np.empty((H, W), dtype=np.int32)
+        for dy, dx in _offsets(search):
+            d2 = uniform_filter((np.roll(np.roll(g_nb, dy, 0), dx, 1) - g_target) ** 2, patch)
+            better = d2 < best_d
+            if not better.any():
+                continue
+            best_d = np.where(better, d2, best_d)
+            # np.roll(nb, dy, 0)[y, x] == nb[(y - dy) % H, (x - dx) % W]
+            idx = ((yy - dy) % H) * W + ((xx - dx) % W)
+            take = np.where(better, idx, take)
+        out.append((np.exp(-best_d / scale), take))
+    return out
+
+
+def _apply_gate(target, neighbours, gate):
+    """Average `target` with its neighbours under a precomputed gate (see `_match`).
+
+    One gather per neighbour — the gate already resolved WHERE each pixel's match is.
+    """
+    acc = target.astype(np.float32).copy()              # the current frame always carries weight 1
     wsum = np.ones(target.shape, dtype=np.float32)
-    for nb, g_nb in zip(neighbours, g_neighbours):
-        best_d = np.full(target.shape, np.inf, dtype=np.float32)
-        best_v = np.empty_like(best_d)
-        for dy in range(-search, search + 1):
-            for dx in range(-search, search + 1):
-                d2 = uniform_filter((np.roll(np.roll(g_nb, dy, 0), dx, 1) - g_target) ** 2, patch)
-                better = d2 < best_d
-                if not better.any():
-                    continue
-                best_d = np.where(better, d2, best_d)
-                best_v = np.where(better, np.roll(np.roll(nb, dy, 0), dx, 1), best_v)
-        w = np.exp(-best_d / scale)
-        acc += w * best_v
+    for nb, (w, take) in zip(neighbours, gate):
+        acc += w * nb.reshape(-1)[take].reshape(acc.shape)
         wsum += w
     return acc / wsum
+
+
+def _gate_one(target, neighbours, g_target, g_neighbours, scale, search, patch):
+    """One frame, one channel — match then apply. Kept as the single-channel spelling."""
+    return _apply_gate(target, neighbours,
+                       _match(g_target, g_neighbours, scale, search, patch))
 
 
 def _scale_from(guide, sigma, k):
@@ -316,10 +347,31 @@ def gated_frame(window, guide=None, search=DEFAULT_SEARCH, patch=DEFAULT_PATCH, 
     g = w if guide is None else np.asarray(guide, dtype=np.float32)
     if g.shape != w.shape:
         raise ValueError(f"guide shape {g.shape} does not match window shape {w.shape}")
-    c = w.shape[0] // 2
-    idx = [i for i in range(w.shape[0]) if i != c]
-    return _gate_one(w[c], [w[i] for i in idx], g[c], [g[i] for i in idx],
-                     _scale_from(g, sigma, k), int(search), int(patch))
+    return gated_frames([w], guide=g, search=search, patch=patch, sigma=sigma, k=k)[0]
+
+
+def gated_frames(windows, guide, search=DEFAULT_SEARCH, patch=DEFAULT_PATCH, sigma=None, k=1.0):
+    """`gated_frame` for SEVERAL channels that share one gate — the form multi-channel callers want.
+
+    The match and the weights come from `guide` alone, so they are identical for every channel. Calling
+    `gated_frame` per channel recomputes them C times: the block match is a `uniform_filter` per
+    candidate offset, while applying a known match is an `np.roll`, so the redundant work dominates.
+    Measured on a 4-channel plane this is the difference between 4x and 1x the matching cost.
+
+    `windows` is a sequence of (W, Y, X) windows, all co-registered with `guide`. Returns the filtered
+    CENTRE frame of each, in order.
+    """
+    g = np.asarray(guide, dtype=np.float32)
+    ws = [np.asarray(w, dtype=np.float32) for w in windows]
+    for w in ws:
+        if w.shape != g.shape:
+            raise ValueError(f"window shape {w.shape} does not match guide shape {g.shape}")
+    if g.shape[0] <= 1:
+        return [w[0] for w in ws]
+    c = g.shape[0] // 2
+    idx = [i for i in range(g.shape[0]) if i != c]
+    gate = _match(g[c], [g[i] for i in idx], _scale_from(g, sigma, k), int(search), int(patch))
+    return [_apply_gate(w[c], [w[i] for i in idx], gate) for w in ws]
 
 
 def _gated_plane_series(stack, guide, frames, search, patch, scale):

@@ -88,6 +88,13 @@ would decide differently at one voxel and break the cross-channel ratio, and it 
 (36% vs 43% noise removed), because a dim channel then gates on its own noise instead of inheriting
 the match found in the total signal.
 
+**Multi-channel callers want `gated_frames`, not a loop over `gated_frame`.** The match depends only
+on the guide, so gating N channels one at a time computes the identical block match N times — and the
+match is the expensive half (a filter per candidate offset), while applying a known one is a single
+gather. Measured on a real 4-channel plane: 548 ms per-channel vs 150 ms shared, which is 31 min vs
+8.6 min over a 180t x 19z movie. A test counts the matches, because nothing about the OUTPUT changes if
+this regresses.
+
 `gated_frame` is the STREAMING form, for a caller holding a rolling window: the series form would
 compute all W outputs to keep one. **Pass `sigma` when streaming** — estimated per window it is a small
 sample, so gate strictness would drift across a movie; `noise_sigma` over a representative slab is the

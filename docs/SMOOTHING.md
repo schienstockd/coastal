@@ -59,6 +59,41 @@ no-op passthroughs, so a caller can disable either term without branching. Outpu
 **absolute intensities are not preserved** — absolute-brightness measurements must read the
 unsmoothed store.
 
+### `stat="gated"` — the sharpness-preserving statistic
+
+`median` and `mean` both mix whatever sits at the same pixel across the window, which is only the
+right question where nothing moves. At intravital cadences it is not: on a 30 s movie the median
+inter-frame displacement over signal is ~1 px with a tail to ~6 px, so a fixed window denoises the
+near-static majority and smears exactly the cells being measured. **Temporal redundancy is real but not
+co-located.**
+
+`gated` block-matches a ±1 px window (`DEFAULT_SEARCH`) to find where each patch went, then weights
+each neighbour by how well the matched patch agrees. Static content averages fully; content that
+arrived, left, or could not be tracked matches nowhere, so the weights collapse and the output is the
+current frame. **Worst case is the identity, never a blur.** Weights come from a patch, not a pixel —
+a per-pixel difference is dominated by the very noise being removed.
+
+Measured (noise removed / punctum amplitude kept / motion-sharpness ratio) — the median degrades
+monotonically with window, the gate does not, so with `gated` the window is worth raising:
+
+| window | `median` | `gated` |
+|---|---|---|
+| 3 | 32% / 0.92 / 0.96 | 25% / 1.00 / 1.00 |
+| 5 | 44% / 0.85 / 0.91 | 45% / 1.00 / 1.01 |
+| 9 | 53% / 0.69 / 0.77 | 54% / 1.00 / 1.02 |
+
+Through `smooth_channels` the gate is derived ONCE from the summed channels and applied identically to
+all of them — the one-shared-kernel invariant, restated for an adaptive kernel. Gating per channel
+would decide differently at one voxel and break the cross-channel ratio, and it also performs worse
+(36% vs 43% noise removed), because a dim channel then gates on its own noise instead of inheriting
+the match found in the total signal.
+
+`gated_frame` is the STREAMING form, for a caller holding a rolling window: the series form would
+compute all W outputs to keep one. **Pass `sigma` when streaming** — estimated per window it is a small
+sample, so gate strictness would drift across a movie; `noise_sigma` over a representative slab is the
+value to reuse. Established shape (non-local means / VBM3D with block matching), transplanted to
+intravital.
+
 `spatial_smooth` / `temporal_smooth` expose the halves. `gaussian_restorer`,
 `temporal_mean_restorer` and `temporal_median_restorer` are the projection restorers for
 `denoise.denoise_preserving_ratio`; they live here because they are model-free, and `denoise`

@@ -60,7 +60,7 @@ def test_yields_the_15_metric_contract(reference):
 
 
 def test_computes_only_the_flows_the_frame_reads(monkeypatch):
-    """The point of the helper: 9 Farneback calls where the full pipeline needs 53.
+    """The point of the helper: 7 Farneback calls where the full pipeline needs 53.
 
     Counted by patching the module-level flow function, which only works because this path is
     SERIAL — `prepare_data_for_unet` fans out over joblib, so its own calls cannot be counted the
@@ -70,17 +70,31 @@ def test_computes_only_the_flows_the_frame_reads(monkeypatch):
     import coastal.flow as flow_mod
 
     calls = []
+    call_pairs = []
     real = flow_mod.calc_flow_farneback_between_frames
+    window = _window()
 
     def counting(a, b):
         calls.append(1)
+        # identify the pair by which window rows these arrays are
+        idx = [next(i for i in range(len(window)) if np.array_equal(window[i], f))
+               for f in (a, b)]
+        call_pairs.append(tuple(idx))
         return real(a, b)
 
     monkeypatch.setattr(flow_mod, "calc_flow_farneback_between_frames", counting)
-    flow_metrics_for_frame(_window(), 8, SCALES, CUMWIN)
+    flow_metrics_for_frame(window, 8, SCALES, CUMWIN)
 
-    # 4 scales x 1 flow each + (cumulative_window - 1) consecutive pairs
-    assert len(calls) == len(SCALES) + (CUMWIN - 1)
+    # 4 scales x 1 flow each + (cumulative_window - 1) consecutive pairs, MINUS the one pair the
+    # two sets share: scale 1 reads (center-1, center), which the cumulative window also covers.
+    # That overlap is not incidental to this config — it holds whenever 1 is among the scales and
+    # the cumulative window reaches the centre, i.e. every stock setup — and it used to be flowed
+    # twice per plane.
+    shared = 1 if (1 in SCALES and CUMWIN > 1) else 0
+    assert len(calls) == len(SCALES) + (CUMWIN - 1) - shared
+
+    pairs = {tuple(sorted(c)) for c in call_pairs}
+    assert len(pairs) == len(calls), "a frame pair was flowed more than once"
 
     full_pipeline = sum(17 - s for s in SCALES) + 17 * (CUMWIN - 1)
     assert len(calls) < full_pipeline / 5, (
@@ -124,3 +138,46 @@ def test_value_range_makes_two_windows_of_one_movie_photometrically_consistent()
 def test_center_outside_the_window_is_an_error():
     with pytest.raises(IndexError):
         flow_metrics_for_frame(_window(t=6), 6, SCALES, CUMWIN)
+
+
+def test_flow_cache_is_reused_across_overlapping_windows(monkeypatch):
+    """The cross-call saving: stepping t re-flows only the pairs it has not seen.
+
+    Tiled inference centres a window on each timepoint, so consecutive windows overlap by all but
+    one frame and the cumulative sum re-reads the same consecutive pairs. With a shared cache the
+    second timepoint pays for the scale flows (whose pairs move with t) and the ONE new consecutive
+    pair, not for all seven.
+    """
+    import coastal.flow as flow_mod
+
+    movie = _window(t=20)
+    calls = []
+    real = flow_mod.calc_flow_farneback_between_frames
+    monkeypatch.setattr(flow_mod, "calc_flow_farneback_between_frames",
+                        lambda a, b: (calls.append(1), real(a, b))[1])
+
+    cache = {}
+    # window centred on t=9 then on t=10, offsets chosen so the absolute keys line up
+    flow_metrics_for_frame(movie[1:18], 8, SCALES, CUMWIN, flow_cache=cache, window_offset=1)
+    first = len(calls)
+    flow_metrics_for_frame(movie[2:19], 8, SCALES, CUMWIN, flow_cache=cache, window_offset=2)
+    second = len(calls) - first
+
+    assert first == 7
+    assert second == len(SCALES), (
+        f"{second} flows on the second window; only the {len(SCALES)} scale pairs move with t")
+
+
+def test_flow_cache_does_not_change_the_metrics():
+    """A cache is a speed change or it is a bug. Same planes, cached or not."""
+    movie = _window(t=20)
+    plain = flow_metrics_for_frame(movie[1:18], 8, SCALES, CUMWIN)
+    cache = {}
+    flow_metrics_for_frame(movie[0:17], 8, SCALES, CUMWIN, flow_cache=cache, window_offset=0)
+    cached = flow_metrics_for_frame(movie[1:18], 8, SCALES, CUMWIN,
+                                    flow_cache=cache, window_offset=1)
+
+    assert np.array_equal(plain[0], cached[0])
+    assert sorted(plain[1]) == sorted(cached[1])
+    for k in plain[1]:
+        np.testing.assert_array_equal(plain[1][k], cached[1][k], err_msg=f"metric {k} differs")

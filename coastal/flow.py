@@ -532,7 +532,7 @@ def prepare_data_for_unet(frames, temporal_scales=[1, 2, 4, 8], cumulative_windo
 
 
 def flow_metrics_for_frame(window, center, temporal_scales=[1, 2, 4, 8], cumulative_window=5,
-                           value_range=None):
+                           value_range=None, flow_cache=None, window_offset=0):
     """The metric planes for ONE frame of a window, computing only the flows that frame reads.
 
     `prepare_data_for_unet` builds every flow in the stack because training consumes every frame.
@@ -564,6 +564,12 @@ def flow_metrics_for_frame(window, center, temporal_scales=[1, 2, 4, 8], cumulat
                            invents motion that was not imaged.
         temporal_scales:   frame lags to compute flow over. MUST match the trained model's.
         cumulative_window: centred window for the cumulative displacement. MUST match the model's.
+        flow_cache:        optional mutable mapping reused ACROSS calls, `(i, j)` absolute frame
+                           indices -> `(vx, vy)`. Farneback dominates this function and consecutive
+                           windows overlap heavily, so a caller stepping through timepoints should
+                           pass one (see the note in the body). None still memoises within the call.
+        window_offset:     absolute index of `window[0]` in the movie — what makes `flow_cache`
+                           keys comparable between calls. Ignored when `flow_cache` is None.
         value_range:       `(lo, hi)` for the 0–1 intensity scaling, instead of the window's own
                            min/max. **Tiled inference should pass this.** Training scales by the
                            whole movie's min/max, so leaving it to a single tile-window would give
@@ -582,6 +588,32 @@ def flow_metrics_for_frame(window, center, temporal_scales=[1, 2, 4, 8], cumulat
     if not 0 <= center < N:
         raise IndexError(f"center {center} outside window of {N} frames")
 
+    # Farneback is ~94% of this function (0.51 s of 0.54 s on a 420x441 plane), so no frame PAIR is
+    # ever flowed twice. Within one call that is not a hypothetical: `scale=1` picks the pair
+    # (center-1, center), and the cumulative window below covers that same pair — it was computed
+    # twice, every plane, on every stock [1,2,4,8]/5 config.
+    #
+    # `flow_cache` extends the same rule ACROSS calls, which is where the real redundancy is. Tiled
+    # inference walks t with a window centred on it, so at radius 8 the windows for t and t+1 share
+    # 16 of 17 frames, and the four consecutive-frame flows the cumulative sum needs at t are four
+    # of the five it needs at t+1. Keys are ABSOLUTE frame indices (`window_offset` + local), so a
+    # caller reusing one dict across timepoints hits; a caller passing None gets per-call memoing
+    # only and the previous behaviour. The cache is the caller's to bound and to key by whatever
+    # else makes two windows incomparable — z-plane, channel projection, normalisation.
+    local_cache = {}
+
+    def _flow(i, j):
+        key = (window_offset + i, window_offset + j)
+        hit = local_cache.get(key)
+        if hit is None and flow_cache is not None:
+            hit = flow_cache.get(key)
+        if hit is None:
+            hit = calc_flow_farneback_between_frames(frames_array[i], frames_array[j])
+            if flow_cache is not None:
+                flow_cache[key] = hit
+        local_cache[key] = hit
+        return hit
+
     # Mirror prepare_data_for_unet: the key is always present, empty when the window is too short,
     # because extract_temporal_metrics skips an empty list rather than raising.
     multi_scale_flows = {}
@@ -592,7 +624,7 @@ def flow_metrics_for_frame(window, center, temporal_scales=[1, 2, 4, 8], cumulat
             continue
         # the one flow `extract_temporal_metrics` will pick for `center`
         i = min(n_flows - 1, max(0, center - 1))
-        vx, vy = calc_flow_farneback_between_frames(frames_array[i], frames_array[i + scale])
+        vx, vy = _flow(i, i + scale)
         multi_scale_flows[scale] = [{'u': vx, 'v': vy, 'scale': scale,
                                      'frame_pair': (i, i + scale)}]
 
@@ -604,7 +636,7 @@ def flow_metrics_for_frame(window, center, temporal_scales=[1, 2, 4, 8], cumulat
     vy_cum = np.zeros(frames_array.shape[1:], dtype=np.float32)
     for idx in range(win_start, win_end - 1):
         try:
-            vx, vy = calc_flow_farneback_between_frames(frames_array[idx], frames_array[idx + 1])
+            vx, vy = _flow(idx, idx + 1)
         except Exception:
             continue
         vx_cum += vx

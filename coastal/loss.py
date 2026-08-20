@@ -60,6 +60,35 @@ def _blob_target(scalar_map, blur_sigma, norm_percentile):
     return torch.clamp(target.float() / hi, 0, 1)
 
 
+def bce_floor(target):
+    """The loss a PERFECT model achieves against this soft target: `mean H(target)`.
+
+    Every prob-head term here is `binary_cross_entropy_with_logits` against a target that is a
+    deterministic function of the input — brightness blurred and rescaled, dominant-colour
+    confidence, an intensity/contrast/edge blend. BCE against a soft target cannot reach 0: its
+    minimum is the target's own binary entropy, reached when the prediction equals the target
+    exactly. That minimum is a property of the DATA, not of the model.
+
+    Why record it: without it a loss curve is unreadable. Measured on flow.cyto (6 images, 2880
+    frames), `foreground` settles at 0.26508 and this floor is 0.26499 — the model's entire
+    remaining error is 0.00009, so 99.97% of the number plotted is a constant no model can move,
+    and "the loss plateaus and nothing is learned after epoch 5" is a description of convergence.
+    The same curve minus this floor goes to zero and says so.
+
+    NOT applicable to the contrastive terms (`TemporalMetricsLoss`, `VarianceMetricsLoss`,
+    `WarpConsistencyLoss`, `ConfettiBoundaryLoss`): they are hinges and cosine distances whose
+    minimum IS 0, so there is nothing to subtract and a floor of 0 is the honest answer.
+
+    Clamped rather than epsilon-added: `H(0)` and `H(1)` are exactly 0, but computing them directly
+    is `0 * log(0)` = `nan`, and one saturated pixel would take out the whole epoch's mean. At the
+    clamp `H` reads ~1.7e-6 instead of 0 — four orders below anything a loss curve is read to, and
+    pinned by `tests/test_loss_floor.py::test_a_hard_target_has_a_floor_of_zero`.
+    """
+    with torch.no_grad():
+        t = target.float().clamp(1e-7, 1 - 1e-7)
+        return -(t * t.log() + (1 - t) * (1 - t).log()).mean()
+
+
 def flow_discontinuity(metrics_dict, device=None):
     """A genuine flow-BOUNDARY signal from the metrics already computed: where does the flow field
     tear?
@@ -145,18 +174,20 @@ class ForegroundLoss(nn.Module):
         self.norm_percentile = norm_percentile
         self.boundary_weight = boundary_weight
 
-    def forward(self, pred_prob, frame, boundary=None):
-        """
+    def target(self, frame, boundary=None):
+        """The BCE target this loss fits — ONE implementation, used by `forward` and by the caller
+        that wants `bce_floor` of it.
+
+        Public because the floor of a soft target is only meaningful for the target the loss
+        actually used: a second copy of this arithmetic in the training loop is how a reported
+        floor and the curve it is subtracted from drift apart while both look plausible.
+
         Args:
-            pred_prob: [B, 1, H, W] raw model logits (before sigmoid)
-            frame:     [B, C, H, W] intensity image(s); C>1 is reduced by max over channels
-            boundary:  optional [B, 1, H, W] flow-discontinuity map (see
-                       `flow_discontinuity`). Where it is high the foreground target is
-                       suppressed, so the prob map pinches between differently-moving cells.
-                       This is the ONLY path by which optical flow reaches the labels —
-                       see the class docstring.
-        Returns:
-            BCE against the brightness-at-cell-scale target.
+            frame:    [B, C, H, W] intensity image(s); C>1 is reduced by max over channels
+            boundary: optional [B, 1, H, W] flow-discontinuity map (see `flow_discontinuity`).
+                      Where it is high the target is suppressed, so the prob map pinches between
+                      differently-moving cells. This is the ONLY path by which optical flow
+                      reaches the labels — see the class docstring.
         """
         bright = frame.float()
         bright = bright.max(dim=1, keepdim=True).values if bright.size(1) > 1 else bright
@@ -169,7 +200,28 @@ class ForegroundLoss(nn.Module):
             # tears, which is what separates two cells sliding past each other.
             b = _blob_target(boundary.float(), self.blur_sigma, self.norm_percentile)
             target = torch.clamp(target - self.boundary_weight * b, 0.0, 1.0)
-        return F.binary_cross_entropy_with_logits(pred_prob.float(), target)
+        return target
+
+    def with_floor(self, pred_prob, frame, boundary=None):
+        """`(loss, floor)` from ONE target build — what the training loop calls.
+
+        Both from the same `target()` call, deliberately: a floor computed from a separately built
+        target is a number that can drift from the curve it is subtracted from while both still
+        look plausible. See `bce_floor`.
+        """
+        t = self.target(frame, boundary)
+        return F.binary_cross_entropy_with_logits(pred_prob.float(), t), bce_floor(t)
+
+    def forward(self, pred_prob, frame, boundary=None):
+        """
+        Args:
+            pred_prob: [B, 1, H, W] raw model logits (before sigmoid)
+            frame:     [B, C, H, W] intensity image(s); C>1 is reduced by max over channels
+            boundary:  optional [B, 1, H, W] flow-discontinuity map — see `target`.
+        Returns:
+            BCE against the brightness-at-cell-scale target.
+        """
+        return self.with_floor(pred_prob, frame, boundary)[0]
 
 
 class ConfettiForegroundLoss(nn.Module):
@@ -235,19 +287,17 @@ class ConfettiForegroundLoss(nn.Module):
         """Separable Gaussian at cell scale, so the target is blobs not pixels."""
         return _blur_at_cell_scale(x, self.blur_sigma)
 
-    def forward(self, pred_prob, variance_metrics):
-        """
-        Args:
-            pred_prob:         [B, 1, H, W] raw model logits (before sigmoid)
-            variance_metrics:  list of B dicts with `softmax_ch_*` [H, W] arrays
-        Returns:
-            BCE against the confetti foreground target, or 0.0 if no metrics supplied.
+    def target(self, pred_prob, variance_metrics):
+        """The BCE target this loss fits, or `None` when no `softmax_ch_*` metrics were supplied.
+
+        ONE implementation, shared with `bce_floor` — see `ForegroundLoss.target`. `pred_prob` is
+        taken only for its device and dtype; nothing about the prediction enters the target.
         """
         targets = []
         for m in variance_metrics:
             keys = sorted(k for k in m.keys() if k.startswith('softmax_ch_'))
             if not keys:
-                return torch.zeros((), device=pred_prob.device, dtype=torch.float32)
+                return None
             stack = torch.stack([
                 (v if isinstance(v, torch.Tensor) else torch.from_numpy(v))
                 .to(pred_prob.device).float()
@@ -258,8 +308,29 @@ class ConfettiForegroundLoss(nn.Module):
         # The blur and the percentile rescale are shared with `ForegroundLoss` — see `_blob_target`,
         # which also records the measurement that the two agree to r >= 0.99, because the
         # dominant-colour term above is pinned near its 1/C floor on real data.
-        target = _blob_target(scalar_map, self.blur_sigma, self.norm_percentile)
-        return F.binary_cross_entropy_with_logits(pred_prob.float(), target)
+        return _blob_target(scalar_map, self.blur_sigma, self.norm_percentile)
+
+    def with_floor(self, pred_prob, variance_metrics):
+        """`(loss, floor)` from ONE target build — see `ForegroundLoss.with_floor`.
+
+        Both are 0 when no confetti metrics were supplied: with no target there is no objective, so
+        a floor of 0 is the honest report rather than a `nan` that would poison the curve.
+        """
+        t = self.target(pred_prob, variance_metrics)
+        if t is None:
+            zero = torch.zeros((), device=pred_prob.device, dtype=torch.float32)
+            return zero, zero
+        return F.binary_cross_entropy_with_logits(pred_prob.float(), t), bce_floor(t)
+
+    def forward(self, pred_prob, variance_metrics):
+        """
+        Args:
+            pred_prob:         [B, 1, H, W] raw model logits (before sigmoid)
+            variance_metrics:  list of B dicts with `softmax_ch_*` [H, W] arrays
+        Returns:
+            BCE against the confetti foreground target, or 0.0 if no metrics supplied.
+        """
+        return self.with_floor(pred_prob, variance_metrics)[0]
 
 
 class ConfettiBoundaryLoss(nn.Module):
@@ -398,11 +469,10 @@ class IntensityLoss(nn.Module):
     docs/SEGMENTATION.md.
     """
 
-    def forward(self, pred_prob, frame):
-        """
-        Args:
-            pred_prob: [B, 1, H, W] raw model logits (before sigmoid)
-            frame: [B, 1, H, W] intensity images
+    def target(self, frame):
+        """The BCE target this loss fits — ONE implementation, shared with `bce_floor`.
+
+        See `ForegroundLoss.target` for why this is public rather than inlined in `forward`.
         """
         # Build target in float32 regardless of AMP dtype
         frame = frame.float()
@@ -430,10 +500,21 @@ class IntensityLoss(nn.Module):
         edge_norm = torch.clamp((edge - edge_mean) / edge_std, 0, 1)
 
         cell_target = 0.5 * bright + 0.3 * contrast_norm + 0.2 * edge_norm
-        cell_target = cell_target ** 0.5  # push cell regions toward 1.0
+        return cell_target ** 0.5  # push cell regions toward 1.0
 
+    def with_floor(self, pred_prob, frame):
+        """`(loss, floor)` from ONE target build — see `ForegroundLoss.with_floor`."""
+        t = self.target(frame)
         # binary_cross_entropy_with_logits is AMP-safe (fuses sigmoid internally)
-        return F.binary_cross_entropy_with_logits(pred_prob.float(), cell_target)
+        return F.binary_cross_entropy_with_logits(pred_prob.float(), t), bce_floor(t)
+
+    def forward(self, pred_prob, frame):
+        """
+        Args:
+            pred_prob: [B, 1, H, W] raw model logits (before sigmoid)
+            frame: [B, 1, H, W] intensity images
+        """
+        return self.with_floor(pred_prob, frame)[0]
 
 
 def _contrastive_metric_loss(metric_emb, metrics_dict, k_neighbors, margin, max_pixels=5000):

@@ -6,7 +6,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 
 from coastal.model import UNetWithEmbeddings
-from coastal.loss import (ConfettiBoundaryLoss, ConfettiForegroundLoss, ForegroundLoss,
+from coastal.loss import (bce_floor, ConfettiBoundaryLoss, ConfettiForegroundLoss, ForegroundLoss,
                           flow_discontinuity,
                           IntensityLoss,
                           TemporalMetricsLoss, VarianceMetricsLoss, WarpConsistencyLoss)
@@ -294,7 +294,10 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
 
     Returns:
         model, history — `history[term]` per epoch, plus `history['val_' + term]` when a
-        validation split was supplied.
+        validation split was supplied, plus `history['floor_' + term]` for the BCE terms
+        (`intensity`, `confetti`, `foreground`): the loss a perfect model would reach against that
+        epoch's targets. Unweighted, like the terms themselves. A term's real progress is
+        `term - floor_term`; `total`'s floor is the same weighted sum the total is.
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -422,9 +425,16 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
 
     TERMS = ('total', 'variance', 'intensity', 'temporal', 'warp', 'confetti', 'foreground',
              'boundary')
-    history = {k: [] for k in TERMS}
+    # The BCE terms fit a SOFT target, so each has an irreducible floor — `mean H(target)`, a
+    # property of the data. `foreground` on flow.cyto settles 0.00009 above its floor of 0.26499, so
+    # without these a converged run is indistinguishable from a stalled one and 99.97% of the number
+    # on the axis is a constant. The contrastive terms (temporal, variance, warp, boundary) are
+    # hinges with a minimum of 0 and get no floor rather than a fabricated zero one.
+    FLOOR_OF = ('intensity', 'confetti', 'foreground')
+    KEYS = TERMS + tuple(f'floor_{k}' for k in FLOOR_OF)
+    history = {k: [] for k in KEYS}
     if val_loader is not None:
-        history.update({f'val_{k}': [] for k in TERMS})
+        history.update({f'val_{k}': [] for k in KEYS})
 
     def batch_losses(batch, training):
         """Every loss term for one batch, as tensors keyed like `history`.
@@ -462,9 +472,10 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             pred_prob = model.prob_head(decoded)
             metric_emb = model.emb_head(decoded)
 
-            l_intensity = loss_intensity(pred_prob, channels)
-            l_confetti = loss_confetti(pred_prob, v_metrics) if loss_confetti is not None \
-                else torch.tensor(0.0, device=device)
+            zero = torch.zeros((), device=device)
+            l_intensity, f_intensity = loss_intensity.with_floor(pred_prob, channels)
+            l_confetti, f_confetti = loss_confetti.with_floor(pred_prob, v_metrics) \
+                if loss_confetti is not None else (zero, zero)
             l_boundary = loss_boundary(metric_emb, v_metrics) \
                 if loss_boundary is not None else torch.tensor(0.0, device=device)
             # `channels` is the projected frame, so this needs no variance metrics at all.
@@ -476,8 +487,9 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
                 bs = [flow_discontinuity(m, device=device) for m in t_metrics]
                 if all(b is not None for b in bs):
                     fg_boundary = torch.stack(bs, dim=0)
-            l_foreground = loss_foreground(pred_prob, channels, fg_boundary) \
-                if loss_foreground is not None else torch.tensor(0.0, device=device)
+            l_foreground, f_foreground = \
+                loss_foreground.with_floor(pred_prob, channels, fg_boundary) \
+                if loss_foreground is not None else (zero, zero)
             l_temporal = loss_temporal(metric_emb, t_metrics)
             l_variance = loss_variance(metric_emb, v_metrics, frame_indices=frame_indices) if use_variance else \
                 torch.tensor(0.0, device=device)
@@ -505,11 +517,15 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
 
         return {'total': total_loss, 'intensity': l_intensity, 'temporal': l_temporal,
                 'variance': l_variance, 'warp': l_warp, 'confetti': l_confetti,
-                'foreground': l_foreground, 'boundary': l_boundary}
+                'foreground': l_foreground, 'boundary': l_boundary,
+                # Not weighted here, exactly like the terms themselves — the caller pairs each with
+                # its weight, and `total`'s own floor is then the same weighted sum.
+                'floor_intensity': f_intensity, 'floor_confetti': f_confetti,
+                'floor_foreground': f_foreground}
 
     for epoch in range(num_epochs):
         model.train()
-        epoch_losses = {k: 0.0 for k in TERMS}
+        epoch_losses = {k: 0.0 for k in KEYS}
 
         for batch_idx, batch in enumerate(dataloader):
             losses = batch_losses(batch, training=True)
@@ -524,11 +540,11 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             scaler.step(optimizer)
             scaler.update()
 
-            for k in TERMS:
+            for k in KEYS:
                 epoch_losses[k] += losses[k].item()
 
         n = len(dataloader)
-        for key in TERMS:
+        for key in KEYS:
             epoch_losses[key] /= n
             history[key].append(epoch_losses[key])
 
@@ -546,14 +562,14 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
             rng_state = torch.get_rng_state()
             cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             model.eval()
-            val_losses = {k: 0.0 for k in TERMS}
+            val_losses = {k: 0.0 for k in KEYS}
             with torch.no_grad():
                 for batch in val_loader:
                     losses = batch_losses(batch, training=False)
-                    for k in TERMS:
+                    for k in KEYS:
                         val_losses[k] += losses[k].item()
             nv = max(1, len(val_loader))
-            for key in TERMS:
+            for key in KEYS:
                 history[f'val_{key}'].append(val_losses[key] / nv)
             torch.set_rng_state(rng_state)
             if cuda_rng_state is not None:
@@ -590,9 +606,14 @@ def train_with_metrics(frames_prep, temporal_metrics_norm, variance_metrics_norm
     print(f"  Temporal:  {history['temporal'][-1]:.4f}")
     print(f"  Variance:  {history['variance'][-1]:.4f}")
     if foreground_weight > 0:
-        print(f"  Foreground:{history['foreground'][-1]:.4f}")
+        # The floor alongside it, because the raw number cannot be read without it: 0.2651 sounds
+        # like a stall and is in fact 0.0001 off the best any model could do on this data.
+        print(f"  Foreground:{history['foreground'][-1]:.4f}"
+              f"   (floor {history['floor_foreground'][-1]:.4f}, "
+              f"excess {history['foreground'][-1] - history['floor_foreground'][-1]:+.5f})")
     if confetti_weight > 0:
-        print(f"  Confetti:  {history['confetti'][-1]:.4f}")
+        print(f"  Confetti:  {history['confetti'][-1]:.4f}"
+              f"   (floor {history['floor_confetti'][-1]:.4f})")
     if boundary_weight > 0:
         print(f"  Boundary:  {history['boundary'][-1]:.4f}")
     if warp_weight > 0:

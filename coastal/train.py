@@ -675,9 +675,31 @@ def load_model(path, device=None):
     model.to(device)
     model.eval()
     if 'metadata' in checkpoint:
-        print(f"Metadata: {checkpoint['metadata']}")
+        print(f"Metadata: {_metadata_summary(checkpoint['metadata'])}")
     print(f"Model loaded from {path}")
     return model
+
+
+# What a caller loading a model actually needs to see. The rest of the manifest is training
+# provenance, and `lossCurves` alone is one float per epoch per loss term — 12 x 100 on a stock
+# run, which printed 23 KB of numbers into the task log every time a model was loaded. A segmenter
+# loads one model per pass, so that was most of the log for a run whose useful output is a label
+# store. The full manifest is not lost: it is still in the checkpoint, and the training task writes
+# it beside the .pt as `<name>.json`, which is what `read_manifest` reads.
+_METADATA_SUMMARY_KEYS = ('channelName', 'temporalScales', 'cumulativeWindow', 'droppedMetrics',
+                          'embeddingDim', 'epochs', 'trainedAt')
+
+
+def _metadata_summary(metadata):
+    """The few manifest fields worth a log line, plus a count of what was left out."""
+    if not isinstance(metadata, dict):
+        return metadata
+    shown = {k: metadata[k] for k in _METADATA_SUMMARY_KEYS if k in metadata}
+    hidden = sorted(k for k in metadata if k not in shown)
+    text = ', '.join(f'{k}={v!r}' for k, v in shown.items())
+    if hidden:
+        text += f' (+{len(hidden)} more: {", ".join(hidden)})'
+    return text
 
 
 def extract_sequences_from_volume(volume, n_sequences=3, seq_len=20, random_seed=None):

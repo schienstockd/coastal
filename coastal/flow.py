@@ -76,31 +76,34 @@ def compute_multi_scale_optical_flow(frames, scales=[1, 2, 4, 8], n_jobs=-1, ver
     return multi_scale_flows
 
 
-def compute_cumulative_displacement_frame(center_idx, frames_array, window_size):
-    """Compute cumulative displacement for a single frame."""
+def compute_cumulative_displacement_frame(center_idx, frames_array, window_size,
+                                          pair_flows=None):
+    """Compute cumulative displacement for a single frame.
+
+    `pair_flows[i]` is the flow for the pair `(i, i+1)` when the caller already has it — see
+    `consecutive_pair_flows`. Without it each centre recomputes its own, which is what
+    `compute_cumulative_displacement` used to do for every frame in the movie.
+    """
     win_start = max(0, center_idx - window_size // 2)
     win_end = min(len(frames_array), center_idx + window_size // 2 + 1)
-    
+
     vx_cum = np.zeros_like(frames_array[0], dtype=np.float32)
     vy_cum = np.zeros_like(frames_array[0], dtype=np.float32)
-    
+
     frame_count = 0
     for idx in range(win_start, win_end - 1):
-        frame1 = frames_array[idx]
-        frame2 = frames_array[idx + 1]
-        
         try:
-            vx, vy = calc_flow_farneback_between_frames(frame1, frame2)
+            if pair_flows is not None and pair_flows[idx] is not None:
+                vx, vy = pair_flows[idx]
+            else:
+                vx, vy = calc_flow_farneback_between_frames(frames_array[idx],
+                                                            frames_array[idx + 1])
             vx_cum += vx
             vy_cum += vy
             frame_count += 1
         except Exception:
             continue
-    
-    if center_idx < 3 or center_idx % 50 == 0:
-        mag_cum = np.sqrt(vx_cum**2 + vy_cum**2)
-        print(f"  Center {center_idx}: {frame_count} frames, cumulative mag: min={mag_cum.min():.6f}, max={mag_cum.max():.6f}")
-    
+
     return {
         'u': vx_cum,
         'v': vy_cum,
@@ -109,8 +112,44 @@ def compute_cumulative_displacement_frame(center_idx, frames_array, window_size)
     }
 
 
-def compute_cumulative_displacement(frames, window_size=5, n_jobs=-1, verbose=True):
-    """Cumulative displacement with parallel processing."""
+def consecutive_pair_flows(frames_array, multi_scale_flows=None, n_jobs=-1):
+    """`[(vx, vy), ...]` for every pair `(i, i+1)`, taken from `multi_scale_flows` where possible.
+
+    The cumulative displacement is a sum of CONSECUTIVE-frame flows, and `scale=1` in
+    `compute_multi_scale_optical_flow` is exactly the set of those flows over the whole movie. They
+    were computed twice: once as `mag_1`'s input and then again, from scratch, inside every
+    centre's window — and since a window covers `cumulative_window - 1` pairs, each pair was
+    recomputed once per centre that reaches it. On the stock [1,2,4,8]/5 config that is ~8T
+    Farneback calls where 4T do, i.e. roughly half of the whole flow stage of a training run.
+
+    Falls back to computing the pairs (once, in parallel) when `scale=1` was not among the scales,
+    which still removes the per-centre repetition.
+    """
+    n = len(frames_array)
+    flows = [None] * max(n - 1, 0)
+
+    for flow in (multi_scale_flows or {}).get(1, []):
+        i, j = flow['frame_pair']
+        if j == i + 1 and 0 <= i < len(flows):
+            flows[i] = (flow['u'], flow['v'])
+
+    missing = [i for i, f in enumerate(flows) if f is None]
+    if missing:
+        computed = Parallel(n_jobs=n_jobs)(
+            delayed(calc_flow_farneback_between_frames)(frames_array[i], frames_array[i + 1])
+            for i in missing)
+        for i, f in zip(missing, computed):
+            flows[i] = f
+    return flows
+
+
+def compute_cumulative_displacement(frames, window_size=5, n_jobs=-1, verbose=True,
+                                    multi_scale_flows=None):
+    """Cumulative displacement with parallel processing.
+
+    Pass `multi_scale_flows` and the consecutive-frame flows are taken from it rather than
+    recomputed — see `consecutive_pair_flows` for how much that is.
+    """
 
     frames_array = np.asarray(frames, dtype=np.float32)
     N = frames_array.shape[0]
@@ -118,12 +157,13 @@ def compute_cumulative_displacement(frames, window_size=5, n_jobs=-1, verbose=Tr
     if verbose:
         print(f"Computing cumulative displacement (parallel, window={window_size})...\n")
 
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(compute_cumulative_displacement_frame)(center_idx, frames_array, window_size)
-        for center_idx in range(N)
-    )
+    pair_flows = consecutive_pair_flows(frames_array, multi_scale_flows, n_jobs=n_jobs)
 
-    cumulative_flows = [r for r in results if r is not None]
+    # Summing a handful of ready arrays is not worth a worker hand-off — the Farneback calls were
+    # the only reason this fanned out, and they have already happened.
+    cumulative_flows = [
+        compute_cumulative_displacement_frame(center_idx, frames_array, window_size, pair_flows)
+        for center_idx in range(N)]
 
     if verbose:
         print(f"✓ {len(cumulative_flows)} cumulative flows\n")
@@ -510,7 +550,8 @@ def prepare_data_for_unet(frames, temporal_scales=[1, 2, 4, 8], cumulative_windo
         frames_array, scales=temporal_scales, verbose=verbose
     )
     cum_flows = compute_cumulative_displacement(
-        frames_array, window_size=cumulative_window, verbose=verbose
+        frames_array, window_size=cumulative_window, verbose=verbose,
+        multi_scale_flows=multi_scale_flows
     )
 
     # Normalize frames for downstream processing

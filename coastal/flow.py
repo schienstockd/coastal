@@ -735,3 +735,122 @@ def extract_dense_flow_pairs(multi_scale_flows: dict, scale: int = 1) -> list:
             uv = np.stack([f['u'], f['v']], axis=-1).astype(np.float32)  # [H, W, 2]
             result.append(uv)
     return result
+
+
+# ─── dense-flow registration (warp each frame to a reference) ─────────────────
+
+_REFERENCE_MODES = ('previous', 'first')
+
+
+def warp_to_reference(
+    vol: np.ndarray,
+    reference: str = 'previous',
+    winsize: int = 25,
+    pyr_levels: int = 5,
+    pyr_scale: float = 0.5,
+    iterations: int = 3,
+    poly_n: int = 5,
+    poly_sigma: float = 1.2,
+    max_shift_px: float | None = None,
+    time_axis: int = 0,
+    return_diagnostics: bool = False,
+):
+    """Dense per-pixel Farneback registration of every frame to a reference frame.
+
+    Unlike frame-level rigid registration (a single translation per frame), this
+    warps every pixel independently — so non-rigid per-frame flexing (e.g. the
+    within-frame deformation from a moving sample being captured row-by-row
+    during a resonant/galvo scan) collapses to the reference geometry. Real
+    biological motion between reference and target is also warped away, so pick
+    the reference to preserve the motion you want to keep.
+
+    Args:
+      vol:               (T, Y, X) float array along time_axis
+      reference:         'previous' — warp vol[t] to align with vol[t-1] (rolling
+                             pairwise, preserves cumulative bulk drift, kills
+                             per-frame flex, small compounding error)
+                         'first'    — warp every vol[t] to vol[0] (fixed
+                             reference, kills cumulative drift too)
+      winsize:           Farneback averaging window (smaller = catches fine
+                         detail + more noise; larger = smoother field)
+      pyr_levels:        number of pyramid levels (more = handles larger
+                         displacements at some flow-smoothness cost)
+      pyr_scale:         pyramid downscale factor per level
+      iterations:        iterations per pyramid level
+      poly_n:            neighborhood size for polynomial expansion
+      poly_sigma:        gaussian sigma for polynomial expansion
+      max_shift_px:      clamp — where |flow| exceeds this, fall back per-pixel
+                         to the identity (leaves vol[t] untouched at that
+                         pixel). None = no clamp.
+      time_axis:         axis of vol treated as time (moved to axis 0 for the
+                         operation and restored on output)
+      return_diagnostics: also return a dict with per-frame flow_max / flow_mean
+                         numpy arrays (useful for a task's QC sidecar)
+
+    Returns:
+      warped: same shape and dtype as vol
+      diagnostics (only if return_diagnostics=True): dict of arrays
+    """
+    if reference not in _REFERENCE_MODES:
+        raise ValueError(
+            f'reference must be one of {_REFERENCE_MODES}, got {reference!r}')
+    if vol.ndim < 3:
+        raise ValueError(f'vol must be at least 3D, got shape {vol.shape}')
+
+    src = np.moveaxis(vol, time_axis, 0)
+    T, H, W = src.shape[0], src.shape[-2], src.shape[-1]
+    if src.ndim > 3:
+        raise ValueError(
+            f'expected (T, Y, X); got extra dims after moveaxis: {src.shape}')
+
+    out = np.empty_like(src)
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    flow_max = np.zeros(T, dtype=np.float32)
+    flow_mean = np.zeros(T, dtype=np.float32)
+
+    farneback_flags = cv2.OPTFLOW_FARNEBACK_GAUSSIAN
+
+    def _flow(ref, mov):
+        return cv2.calcOpticalFlowFarneback(
+            np.asarray(ref, dtype=np.float32),
+            np.asarray(mov, dtype=np.float32),
+            None, pyr_scale, pyr_levels, winsize, iterations,
+            poly_n, poly_sigma, farneback_flags,
+        )
+
+    for t in range(T):
+        if reference == 'previous':
+            if t == 0:
+                out[0] = src[0]
+                continue
+            ref = src[t - 1]
+        else:  # 'first'
+            if t == 0:
+                out[0] = src[0]
+                continue
+            ref = src[0]
+
+        mov = src[t]
+        flow = _flow(ref, mov)
+        mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        flow_max[t] = float(mag.max())
+        flow_mean[t] = float(mag.mean())
+
+        map_x = xx + flow[..., 0]
+        map_y = yy + flow[..., 1]
+        warped = cv2.remap(
+            np.asarray(mov, dtype=np.float32),
+            map_x, map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        if max_shift_px is not None:
+            over = mag > float(max_shift_px)
+            if over.any():
+                warped = np.where(over, np.asarray(mov, dtype=np.float32), warped)
+        out[t] = warped.astype(src.dtype, copy=False)
+
+    out = np.moveaxis(out, 0, time_axis)
+    if return_diagnostics:
+        return out, {'flow_max': flow_max, 'flow_mean': flow_mean}
+    return out

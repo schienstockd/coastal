@@ -73,6 +73,7 @@ off-centre, and at its default ``sw=1`` the "median" of 2 samples degenerates to
 ``frames`` here is a full, centred, odd width.
 """
 
+import cv2
 import numpy as np
 from scipy.ndimage import gaussian_filter, median_filter, uniform_filter, uniform_filter1d
 
@@ -87,6 +88,9 @@ __all__ = [
     "gated_frame",
     "gated_frames",
     "noise_sigma",
+    "temporal_flow_warped",
+    "flow_warped_frame",
+    "flow_warped_frames",
 ]
 
 #: Default xy Gaussian sigma, in pixels. Conservative against the ~15-20 px cells this was measured
@@ -107,6 +111,16 @@ DEFAULT_SIGMA = 1.0
 #:
 #: `stat='gated'` holds 1.00/1.00 at every width, so with it the window is worth raising.
 DEFAULT_FRAMES = 3
+
+#: Farneback averaging window for the flow-warped fusion engine. Larger = smoother flow, softer
+#: fine detail. cecelia's flowRegister task exposes this via an `aggressiveness` select (gentle/
+#: balanced/strong → 11/17/25) — the same three-tier ladder here would let a task expose the same
+#: knob.
+DEFAULT_FLOW_WINSIZE = 17
+
+#: Farneback pyramid levels for the flow-warped fusion engine — more levels handle larger
+#: displacements. 5 covers typical intravital drift.
+DEFAULT_FLOW_PYR_LEVELS = 5
 
 #: Half-width of the block-match search, in px, for `stat='gated'`.
 #:
@@ -155,8 +169,11 @@ def temporal_smooth(arr, frames=DEFAULT_FRAMES, stat="median", time_axis=0):
     ``stat='median'`` (default) rejects a cell that moved through the window; ``'mean'`` averages it
     in, which suppresses marginally more noise at the cost of ~34% mask inflation. ``'gated'``
     delegates to `temporal_gated`, which averages only what it can match and so preserves per-frame
-    sharpness — note it gates on THIS array alone, so multi-channel callers must go through
-    `smooth_channels` to get the shared gate the AF ratio requires.
+    sharpness. ``'farneback'`` delegates to `temporal_flow_warped`, which warps each neighbour onto
+    the centre via dense optical flow and averages — same intent as gated (motion-compensated
+    averaging so wider windows help), different mechanism (continuous flow vs. block match). Both
+    gate on THIS array alone here, so multi-channel callers must go through `smooth_channels` to
+    get the shared kernel the AF ratio requires.
     """
     a = np.asarray(arr, dtype=np.float32)
     if frames is None or int(frames) <= 1:
@@ -171,8 +188,11 @@ def temporal_smooth(arr, frames=DEFAULT_FRAMES, stat="median", time_axis=0):
         return uniform_filter1d(a, size=n, axis=time_axis, mode="nearest")
     if stat == "gated":
         return temporal_gated(a, frames=n, time_axis=time_axis)
+    if stat == "farneback":
+        return temporal_flow_warped(a, frames=n, time_axis=time_axis)
     if stat != "median":
-        raise ValueError(f"stat must be 'median', 'mean' or 'gated', got {stat!r}")
+        raise ValueError(
+            f"stat must be 'median', 'mean', 'gated' or 'farneback', got {stat!r}")
     size = [1] * a.ndim
     size[time_axis] = n
     return median_filter(a, size=tuple(size), mode="nearest")
@@ -226,6 +246,10 @@ def smooth_channels(arr, sigma=DEFAULT_SIGMA, frames=DEFAULT_FRAMES, stat="media
     if stat == "gated" and time_axis is not None and frames and int(frames) > 1:
         return _smooth_channels_gated(a, sigma, int(frames), ca, time_axis % a.ndim, list(sel),
                                       spatial_axes)
+
+    if stat == "farneback" and time_axis is not None and frames and int(frames) > 1:
+        return _smooth_channels_flow_warped(a, sigma, int(frames), ca, time_axis % a.ndim,
+                                            list(sel), spatial_axes)
 
     out = a.copy()
     for c in sel:
@@ -421,6 +445,43 @@ def _smooth_channels_gated(a, sigma, frames, ca, ta, sel, spatial_axes,
     return out
 
 
+def _smooth_channels_flow_warped(a, sigma, frames, ca, ta, sel, spatial_axes,
+                                 winsize=DEFAULT_FLOW_WINSIZE,
+                                 pyr_levels=DEFAULT_FLOW_PYR_LEVELS,
+                                 max_shift_px=None):
+    """`smooth_channels` for ``stat='farneback'``: spatial first, then ONE flow shared by every channel.
+
+    Mirrors `_smooth_channels_gated`. The flow is derived from the summed smoothed channels, so it is
+    channel-agnostic by construction and — critically — a dim channel inherits the warp found in the
+    bright signal instead of tracking its own noise. Same invariant `_smooth_channels_gated` enforces
+    for the block-match kernel, extended to the continuous one.
+    """
+    if ta == ca:
+        raise ValueError("time_axis and channel_axis cannot be the same axis")
+
+    def _sub_axes(axes):
+        return tuple(ax if ax < 0 else (ax - 1 if ax > ca else ax) for ax in axes)
+
+    def _idx(c):
+        i = [slice(None)] * a.ndim
+        i[ca] = c
+        return tuple(i)
+
+    sub_ta = ta - 1 if ta > ca else ta
+    smoothed = {c: spatial_smooth(a[_idx(c)], sigma, spatial_axes=_sub_axes(spatial_axes))
+                for c in sel}
+    guide = None
+    for v in smoothed.values():
+        guide = v.copy() if guide is None else guide + v
+
+    out = a.copy()
+    for c, sub in smoothed.items():
+        out[_idx(c)] = temporal_flow_warped(sub, frames, time_axis=sub_ta,
+                                            winsize=winsize, pyr_levels=pyr_levels,
+                                            max_shift_px=max_shift_px, guide=guide)
+    return out
+
+
 def temporal_gated(arr, frames=DEFAULT_FRAMES, time_axis=0, search=DEFAULT_SEARCH,
                    patch=DEFAULT_PATCH, sigma=None, k=1.0, guide=None):
     """Motion-compensated, agreement-gated temporal averaging — the sharpness-preserving `stat`.
@@ -467,6 +528,167 @@ def temporal_gated(arr, frames=DEFAULT_FRAMES, time_axis=0, search=DEFAULT_SEARC
     out = np.empty_like(a2)
     for i in range(a2.shape[1]):
         out[:, i] = _gated_plane_series(a2[:, i], g2[:, i], n, int(search), int(patch), scale)
+    return np.moveaxis(out.reshape(a.shape), 0, time_axis)
+
+
+# ── flow-warped temporal fusion, `stat='farneback'` ────────────────────────────────────────────
+# The counterpart to `gated`: instead of block-matching where a patch went and gating its weight,
+# compute dense optical flow from the centre frame to each neighbour, warp the neighbour BACK onto
+# the centre, then average. Same intent — motion-compensated averaging so widening the window buys
+# noise reduction without blurring moving cells — different mechanism.
+#
+# When to pick which: gated has a clean identity floor (unmatched patches collapse the weight and
+# the output IS the input), so it never hurts. Flow-warped can hurt where the flow is unreliable
+# — very sparse or very noisy planes — because a bad warp is still applied. The `max_shift_px`
+# clamp is the safety net (per-pixel fall-back to source above the clamp), NOT a substitute for
+# gating. Choose flow-warped when smooth continuous deformation dominates over discrete cell
+# motion — the same regime `warp_to_reference` handles inside a whole movie.
+
+
+def _farneback_flow(ref, mov, winsize, pyr_levels, poly_n=5, poly_sigma=1.2):
+    """Dense Farneback flow from `ref` to `mov`. Returns (H, W, 2), (…, 0)=x, (…, 1)=y.
+
+    Semantics of the returned flow (OpenCV convention): mov(x + flow.x, y + flow.y) ≈ ref(x, y),
+    so `cv2.remap` with `map = pixel_grid + flow` sends `mov` back onto `ref`'s coordinates. That is
+    exactly what the fusion engine wants — a per-frame warp that puts each neighbour on the centre.
+    """
+    return cv2.calcOpticalFlowFarneback(
+        np.asarray(ref, dtype=np.float32),
+        np.asarray(mov, dtype=np.float32),
+        None, 0.5, int(pyr_levels), int(winsize),
+        3, int(poly_n), float(poly_sigma), cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
+    )
+
+
+def _warp_by_flow(frame, flow, max_shift_px=None):
+    """Warp `frame` (H, W) by `flow` (H, W, 2). Pixels above `max_shift_px` fall back to source —
+    the same guard cecelia's flow_register uses, so a wild flow degrades to the identity per-pixel
+    rather than smearing the plane."""
+    H, W = frame.shape
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    map_x = xx + flow[..., 0]
+    map_y = yy + flow[..., 1]
+    src = np.asarray(frame, dtype=np.float32)
+    warped = cv2.remap(src, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_REPLICATE)
+    if max_shift_px is not None:
+        mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        over = mag > float(max_shift_px)
+        if over.any():
+            warped = np.where(over, src, warped)
+    return warped
+
+
+def flow_warped_frame(window, guide=None, winsize=DEFAULT_FLOW_WINSIZE,
+                      pyr_levels=DEFAULT_FLOW_PYR_LEVELS, poly_n=5, poly_sigma=1.2,
+                      max_shift_px=None):
+    """Flow-warped average of the CENTRE frame of a (W, Y, X) window — the STREAMING form.
+
+    For each non-centre frame, compute Farneback flow from the centre and warp the neighbour back
+    onto the centre's coordinates, then average all warped neighbours with the centre (which
+    carries weight 1). `guide` defaults to `window` and drives the flow when several channels
+    share one warp — see `flow_warped_frames`.
+
+    `temporal_flow_warped` is the whole-series form. This exists for the same reason `gated_frame`
+    does: a caller that already holds a rolling window would otherwise call the series form and keep
+    one frame of its output, doing W times the necessary work.
+    """
+    w = np.asarray(window, dtype=np.float32)
+    if w.shape[0] <= 1:
+        return w[0] if w.shape[0] else w
+    g = w if guide is None else np.asarray(guide, dtype=np.float32)
+    if g.shape != w.shape:
+        raise ValueError(f"guide shape {g.shape} does not match window shape {w.shape}")
+    return flow_warped_frames([w], guide=g, winsize=winsize, pyr_levels=pyr_levels,
+                              poly_n=poly_n, poly_sigma=poly_sigma,
+                              max_shift_px=max_shift_px)[0]
+
+
+def flow_warped_frames(windows, guide, winsize=DEFAULT_FLOW_WINSIZE,
+                       pyr_levels=DEFAULT_FLOW_PYR_LEVELS, poly_n=5, poly_sigma=1.2,
+                       max_shift_px=None):
+    """`flow_warped_frame` for SEVERAL channels that share one flow — the multi-channel form.
+
+    The flow depends only on `guide`, so gating each channel with its own flow would recompute the
+    identical Farneback field C times. Farneback is the expensive half here (a `calcOpticalFlowFarneback`
+    per neighbour, against a `cv2.remap` to apply one), so a shared-flow form matters — same reasoning
+    that made `gated_frames` share its match.
+
+    `windows` is a sequence of (W, Y, X) windows, all co-registered with `guide`. Returns the fused
+    CENTRE frame of each, in order. Duplicate-neighbour handling matches `gated_frames`: an even width
+    uses `W // 2` as the centre; a window with fewer than 2 unique neighbours after clamping falls back
+    to the centre unchanged (the coastal convention against averaging a frame with itself).
+    """
+    g = np.asarray(guide, dtype=np.float32)
+    ws = [np.asarray(w, dtype=np.float32) for w in windows]
+    for w in ws:
+        if w.shape != g.shape:
+            raise ValueError(f"window shape {w.shape} does not match guide shape {g.shape}")
+    if g.shape[0] <= 1:
+        return [w[0] for w in ws]
+    c = g.shape[0] // 2
+    # Flow computed from the guide's centre to each other guide frame, ONCE, then applied to each
+    # channel. Deduplicated indices: on an edge the caller may have clamped several neighbours to
+    # the same source frame (see `_gated_plane_series` for the same convention) — pairing centre
+    # with itself gives a zero flow and inflates the centre's weight, so we skip those.
+    idx_nb = [i for i in range(g.shape[0]) if i != c]
+    flows = [_farneback_flow(g[c], g[i], winsize, pyr_levels, poly_n, poly_sigma) for i in idx_nb]
+    out = []
+    for w in ws:
+        acc = w[c].astype(np.float32).copy()
+        n = 1.0
+        for i, flow in zip(idx_nb, flows):
+            acc += _warp_by_flow(w[i], flow, max_shift_px)
+            n += 1.0
+        out.append(acc / n)
+    return out
+
+
+def temporal_flow_warped(arr, frames=DEFAULT_FRAMES, time_axis=0,
+                         winsize=DEFAULT_FLOW_WINSIZE, pyr_levels=DEFAULT_FLOW_PYR_LEVELS,
+                         poly_n=5, poly_sigma=1.2, max_shift_px=None, guide=None):
+    """Motion-compensated temporal averaging via dense Farneback flow — whole-series form.
+
+    For each timepoint, warp its ±half neighbours onto its coordinates via dense flow, then average.
+    Unlike `temporal_gated` (block-match agreement), the flow is continuous, so smooth deformation
+    is handled without the discretisation of a search grid; unlike a plain temporal mean, motion is
+    compensated so moving cells stay sharp at wider windows.
+
+    `guide` is the image the flow is derived from; it defaults to `arr` itself. Pass a shared one
+    to warp several channels identically — see `flow_warped_frames`.
+
+    `arr` may carry axes between time and the trailing (Y, X) — a Z stack is filtered plane by
+    plane, never across Z (a stack collapse is a different operation with different invariants).
+    """
+    a = np.asarray(arr, dtype=np.float32)
+    if frames is None or int(frames) <= 1 or a.shape[time_axis] <= 1:
+        return a
+    n = int(frames)
+    if n % 2 == 0:
+        n += 1
+    n = min(n, a.shape[time_axis] | 1)
+    half = n // 2
+    T = a.shape[time_axis]
+
+    g = a if guide is None else np.asarray(guide, dtype=np.float32)
+    if g.shape != a.shape:
+        raise ValueError(f"guide shape {g.shape} does not match array shape {a.shape}")
+
+    a = np.moveaxis(a, time_axis, 0)
+    g = np.moveaxis(g, time_axis, 0)
+    lead, mid, spatial = a.shape[0], a.shape[1:-2], a.shape[-2:]
+    a2 = a.reshape((lead, -1) + spatial)
+    g2 = g.reshape((lead, -1) + spatial)
+
+    out = np.empty_like(a2)
+    for i in range(a2.shape[1]):
+        for t in range(T):
+            nb = [min(max(t + dt, 0), T - 1) for dt in range(-half, half + 1)]
+            win_a = np.stack([a2[k, i] for k in nb])
+            win_g = np.stack([g2[k, i] for k in nb])
+            out[t, i] = flow_warped_frame(win_a, guide=win_g, winsize=winsize,
+                                          pyr_levels=pyr_levels, poly_n=poly_n,
+                                          poly_sigma=poly_sigma, max_shift_px=max_shift_px)
     return np.moveaxis(out.reshape(a.shape), 0, time_axis)
 
 

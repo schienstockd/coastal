@@ -2942,6 +2942,7 @@ packages:
   - scipy>=1.17
   - scikit-image>=0.24
   - tqdm
+  - threadpoolctl
   requires_python: '>=3.11'
 - pypi: ./
   name: coastal

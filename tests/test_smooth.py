@@ -19,6 +19,7 @@ import pytest
 from coastal.smooth import (
     spatial_smooth, temporal_smooth, smooth_channels, temporal_gated, gated_frame, gated_frames,
     gaussian_restorer, temporal_mean_restorer, temporal_median_restorer,
+    temporal_flow_warped, flow_warped_frame, flow_warped_frames,
 )
 
 
@@ -377,3 +378,157 @@ def test_gated_frames_and_gated_frame_agree():
     many = gated_frames(windows, guide=guide, sigma=2.0)
     for w, m in zip(windows, many):
         np.testing.assert_allclose(gated_frame(w, guide=guide, sigma=2.0), m, rtol=1e-5, atol=1e-3)
+
+
+# ── flow-warped temporal fusion ───────────────────────────────────────────────────────────────
+# Same invariants as the block-match gate — motion-compensated averaging, one shared kernel across
+# channels, safe on a static scene, reachable through the top-level dispatchers — but the mechanism
+# is continuous flow instead of a discrete search. Farneback carries a real cost so the tests use
+# tiny frames.
+
+def _moving_blob(T=5, Y=40, X=40, step=1, amp=90.0, radius=3, noise=1.0, seed=1):
+    """A soft blob translating one px per frame. Farneback needs graded intensity to lock onto —
+    a single-pixel dot (what `_moving_dot` builds) has no gradient for the polynomial expansion."""
+    rng = np.random.default_rng(seed)
+    a = rng.normal(10, noise, size=(T, Y, X)).astype(np.float32)
+    yy, xx = np.mgrid[0:Y, 0:X].astype(np.float32)
+    for t in range(T):
+        cy, cx = 15 + t * step, 15 + t * step
+        a[t] += amp * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * radius ** 2))
+    return a
+
+
+def test_flow_warped_preserves_a_moving_feature_that_the_mean_smears():
+    """The same guarantee `gated` gives, via a different mechanism."""
+    a = _moving_blob()
+    t = len(a) // 2
+    cy, cx = 15 + t, 15 + t
+
+    def peak(stack):
+        return float(stack[t, cy, cx] - np.median(stack[t]))
+
+    raw = peak(a)
+    mn  = peak(temporal_smooth(a, 5, 'mean'))
+    fw  = peak(temporal_smooth(a, 5, 'farneback'))
+    assert mn < 0.85 * raw, f'mean unexpectedly preserved the moving blob ({mn:.1f} vs {raw:.1f})'
+    assert fw > 0.9 * raw, f'farneback lost the moving blob ({fw:.1f} vs {raw:.1f})'
+
+
+def test_flow_warped_removes_noise_where_nothing_moves():
+    rng = np.random.default_rng(2)
+    static = np.zeros((5, 30, 30), np.float32) + 30.0
+    static[:, 10:20, 10:20] = 80.0
+    noisy = static + rng.normal(0, 5.0, static.shape).astype(np.float32)
+    out = temporal_flow_warped(noisy, 5)
+    assert np.std(out - static) < 0.75 * np.std(noisy - static)
+
+
+def test_flow_warped_never_blurs_more_than_doing_nothing_when_clamped_hard():
+    """`max_shift_px=0` forces every pixel to fall back to source — the identity floor."""
+    rng = np.random.default_rng(3)
+    a = rng.normal(10, 4, size=(5, 30, 30)).astype(np.float32)
+    # Warp fully clamped => output must equal the raw mean over the window (nothing was warped).
+    clamped = temporal_flow_warped(a, 5, max_shift_px=0.0)
+    plain_mean = temporal_smooth(a, 5, 'mean')
+    np.testing.assert_allclose(clamped, plain_mean, rtol=1e-4, atol=1e-3)
+
+
+def test_flow_warped_noops_like_the_other_stats():
+    a = _moving_blob()
+    np.testing.assert_array_equal(temporal_flow_warped(a, 1), a)
+    np.testing.assert_array_equal(temporal_flow_warped(a[:1], 5), a[:1])
+
+
+def test_flow_warped_is_reachable_through_temporal_smooth():
+    a = _moving_blob()
+    np.testing.assert_allclose(temporal_smooth(a, 5, 'farneback'),
+                               temporal_flow_warped(a, 5), rtol=1e-5)
+
+
+def test_temporal_smooth_error_message_lists_farneback():
+    a = _moving_blob()
+    with pytest.raises(ValueError, match='farneback'):
+        temporal_smooth(a, 3, 'gate')
+
+
+def test_flow_warped_frames_and_flow_warped_frame_agree():
+    """The multi-channel form is an optimisation, not a different filter — same guarantee gated has."""
+    rng = np.random.default_rng(11)
+    guide = rng.normal(30, 4, size=(5, 32, 32)).astype(np.float32)
+    yy, xx = np.mgrid[0:32, 0:32].astype(np.float32)
+    for t in range(5):
+        guide[t] += 60 * np.exp(-((yy - (12 + t)) ** 2 + (xx - (12 + t)) ** 2) / (2 * 3.0 ** 2))
+    windows = [guide, guide * 2.0]
+    many = flow_warped_frames(windows, guide=guide)
+    for w, m in zip(windows, many):
+        np.testing.assert_allclose(flow_warped_frame(w, guide=guide), m, rtol=1e-5, atol=1e-3)
+
+
+def test_flow_warped_streaming_and_series_forms_agree():
+    """`flow_warped_frame` exists so a streaming caller does not compute W outputs to keep one.
+    It must produce exactly what the series form produces for that frame, or the task and the
+    library silently diverge — same rule `gated_frame` follows."""
+    rng = np.random.default_rng(12)
+    a = rng.normal(20, 3, size=(7, 32, 32)).astype(np.float32)
+    yy, xx = np.mgrid[0:32, 0:32].astype(np.float32)
+    for t in range(7):
+        a[t] += 80 * np.exp(-((yy - (12 + t)) ** 2 + (xx - (12 + t)) ** 2) / (2 * 3.0 ** 2))
+    series = temporal_flow_warped(a, 5)
+    np.testing.assert_allclose(series[3], flow_warped_frame(a[1:6]), rtol=1e-4, atol=1e-3)
+
+
+def test_flow_warped_channels_share_one_flow():
+    """The AF ratio invariant, for the flow kernel: N channels must cost ONE Farneback field, not N.
+
+    Pinned by counting because nothing about the OUTPUT would change if this regressed — the same
+    kind of silent regression the gated test guards against."""
+    import coastal.smooth as cs
+    rng = np.random.default_rng(13)
+    guide = rng.normal(30, 4, size=(5, 32, 32)).astype(np.float32)
+    yy, xx = np.mgrid[0:32, 0:32].astype(np.float32)
+    for t in range(5):
+        guide[t] += 60 * np.exp(-((yy - (12 + t)) ** 2 + (xx - (12 + t)) ** 2) / (2 * 3.0 ** 2))
+    windows = [guide * m for m in (1.0, 2.0, 0.5, 3.0)]
+
+    calls = []
+    real = cs._farneback_flow
+    cs._farneback_flow = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        out = flow_warped_frames(windows, guide=guide)
+    finally:
+        cs._farneback_flow = real
+    # 5 frames, 4 non-centre neighbours ⇒ exactly 4 flow computations regardless of channel count.
+    assert len(calls) == 4, f'flow computed {len(calls)} times for {len(windows)} channels (want 4)'
+    assert len(out) == len(windows)
+
+
+def test_flow_warped_all_channels_get_the_SAME_warp():
+    """Feeding channels that are exact scalar multiples proves it — identical warps preserve the
+    ratio EXACTLY, any per-channel decision does not."""
+    rng = np.random.default_rng(14)
+    guide = rng.normal(30, 4, size=(5, 32, 32)).astype(np.float32)
+    yy, xx = np.mgrid[0:32, 0:32].astype(np.float32)
+    for t in range(5):
+        guide[t] += 60 * np.exp(-((yy - (12 + t)) ** 2 + (xx - (12 + t)) ** 2) / (2 * 3.0 ** 2))
+    a = np.stack([guide, guide * 3.0, guide * 0.25], axis=1)   # (T, C, Y, X), exact multiples
+    out = smooth_channels(a, sigma=0.0, frames=5, stat='farneback', channel_axis=1, time_axis=0)
+    np.testing.assert_allclose(out[:, 1], out[:, 0] * 3.0, rtol=1e-4)
+    np.testing.assert_allclose(out[:, 2], out[:, 0] * 0.25, rtol=1e-4)
+
+
+def test_flow_warped_refuses_a_guide_shape_mismatch():
+    a = np.zeros((5, 16, 16), np.float32)
+    bad = np.zeros((5, 17, 16), np.float32)
+    with pytest.raises(ValueError, match='guide'):
+        flow_warped_frame(a, guide=bad)
+    with pytest.raises(ValueError, match='guide'):
+        temporal_flow_warped(a, 5, guide=bad)
+
+
+def test_flow_warped_does_not_average_across_z():
+    """A (T,Z,Y,X) stack is filtered plane by plane — same opt-in rule the other stats follow."""
+    rng = np.random.default_rng(15)
+    a = rng.normal(10, 1.0, size=(5, 3, 24, 24)).astype(np.float32)
+    a[:, 1] += 100.0                                    # one z-plane far brighter than its neighbours
+    out = temporal_flow_warped(a, 5)
+    assert out[:, 1].mean() > out[:, 0].mean() + 90     # the offset survives: no bleed across z

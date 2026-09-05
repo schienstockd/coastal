@@ -59,4 +59,9 @@ napari = [
 ]
 
 [tool.setuptools]
-packages = ["coastal"]
+# `packages.find` picks up `coastal.support` and any future subpackage without a manual bump here.
+# The explicit `["coastal"]` list missed `coastal.support` when SUPPORT moved in from cecelia
+# (#30) — pytest passed against the source tree but a downstream `pip install` shipped a package
+# without the subpackage, and cecelia's `from coastal.support import ...` raised
+# `ModuleNotFoundError` at runner load. Auto-discovery avoids repeating that.
+packages = { find = { include = ["coastal", "coastal.*"] } }

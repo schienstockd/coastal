@@ -71,6 +71,7 @@ def train_support(
     device: Optional[torch.device] = None,
     on_progress: Callable[[int, int], None] = _noop_progress,
     on_log: Callable[[str], None] = _noop_log,
+    on_batch_loss: Optional[Callable[[int, float], None]] = None,
     seed: int = 0,
 ):
     """Train SUPPORT on a POOLED list of `[T, Y, X]` float tensors.
@@ -88,6 +89,11 @@ def train_support(
         device: torch device to train on (defaults to CUDA if available, else CPU).
         on_progress: `(done, total)` per-batch progress callback (`total = epochs * batches_per_epoch`).
         on_log: `str` log-line callback.
+        on_batch_loss: optional `(step, loss)` callback fired once per gradient step. Lets the
+            caller record a sub-epoch loss trace — SUPPORT typically converges to its plateau
+            within the first ~100 gradient steps, which the per-epoch mean buries. The training
+            convergence plot uses this to render a log(step) view; without it a converged run
+            reads as a flat line and looks like nothing happened.
         seed: RNG seed for the augmentation transform.
 
     Returns:
@@ -142,7 +148,11 @@ def train_support(
             loss = 0.5 * L1(out, target) + 0.5 * L2(out, target)
             loss.backward()
             optim.step()
-            losses.append(loss.item())
+            loss_val = loss.item()
+            losses.append(loss_val)
+            if on_batch_loss is not None:
+                # `done` after increment == 1-based global step; matches on_progress.
+                on_batch_loss(done + 1, loss_val)
             done += 1
             on_progress(done, total)
         ep_loss = float(np.mean(losses))

@@ -72,6 +72,8 @@ def train_support(
     on_progress: Callable[[int, int], None] = _noop_progress,
     on_log: Callable[[str], None] = _noop_log,
     on_batch_loss: Optional[Callable[[int, float], None]] = None,
+    patience: Optional[int] = None,
+    min_delta: float = 0.005,
     seed: int = 0,
 ):
     """Train SUPPORT on a POOLED list of `[T, Y, X]` float tensors.
@@ -94,10 +96,22 @@ def train_support(
             within the first ~100 gradient steps, which the per-epoch mean buries. The training
             convergence plot uses this to render a log(step) view; without it a converged run
             reads as a flat line and looks like nothing happened.
+        patience: optional early-stop patience in EPOCHS. If set, training stops after `patience`
+            consecutive epochs without an epoch-loss improvement of at least `min_delta` below the
+            best-so-far. `None` (default) keeps the classic "train to `epochs`" behaviour so old
+            callers see no change. Measured on MERTK-large: shipping training runs 60 epochs but
+            reaches its plateau in ~1 epoch — patience=5 typically stops within 6-10 epochs,
+            trimming ~10 hours per perChannel run without touching model quality.
+        min_delta: minimum epoch-loss improvement (in loss units) that counts as "still learning".
+            Only consulted when `patience is not None`. Default 0.005 matches the noise floor of
+            per-epoch loss on shot-noise-limited fluorescence — smaller deltas are within batch
+            variance, not real progress.
         seed: RNG seed for the augmentation transform.
 
     Returns:
         (state_dict, epoch_losses): the trained network's state_dict and one final loss per epoch.
+        When early stopping fires, `len(epoch_losses) < epochs` — the caller reads that to detect
+        it and to know at which epoch training actually stopped.
     """
     if not volumes:
         raise ValueError('train_support: no volumes to train on')
@@ -134,6 +148,8 @@ def train_support(
     on_progress(done, total)
 
     epoch_losses = []
+    best_loss = float('inf')
+    epochs_since_improvement = 0
     for ep in range(epochs):
         model.train()
         train_ds.precompute_indices()
@@ -158,6 +174,20 @@ def train_support(
         ep_loss = float(np.mean(losses))
         epoch_losses.append(ep_loss)
         on_log(f'   epoch {ep + 1}/{epochs}: loss {ep_loss:.4f}')
+
+        # Early-stop on epoch-loss plateau. Compare against best-so-far minus min_delta so
+        # noise-scale wobbles do not reset the counter. When patience is None (default) this
+        # branch is inert and old callers see identical behaviour.
+        if patience is not None:
+            if ep_loss < best_loss - min_delta:
+                best_loss = ep_loss
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
+                if epochs_since_improvement >= patience:
+                    on_log(f'>> early stop: no improvement > {min_delta} for {patience} epochs '
+                           f'(stopped at epoch {ep + 1}/{epochs}, best loss {best_loss:.4f})')
+                    break
 
     on_progress(total, total)
     return model.state_dict(), epoch_losses

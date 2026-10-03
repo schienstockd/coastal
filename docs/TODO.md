@@ -23,10 +23,6 @@ what landed lives in `docs/MILESTONES.md` (and git history once this is a repo).
 - [ ] Add a shape/range test for `flow.py::prepare_data_for_unet` output.
 - [ ] Add a `data.py::validate_training_data` round-trip test.
 - [ ] Wire `pytest` into CI (none exists yet).
-- [ ] **Characterize `match_masks_3d` no-overlap relabeling.** At `stitch_threshold=0.0`, two
-      zero-overlap objects sharing an input label stay the *same* label rather than being split.
-      Confirm whether this is intended; pin it with a test either way (see note in
-      `tests/test_utils.py`).
 
 ### Tracking (research — see docs/TRACKING.md + TRACKING_SESSION_SUMMARY.md)
 - [ ] Learned confetti-colour embedding (metric space over RGB) — the top untried idea.

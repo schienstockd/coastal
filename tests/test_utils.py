@@ -73,7 +73,48 @@ def test_match_masks_3d_unifies_same_object_across_slices():
     assert len(lbls0) == 1 and len(lbls1) == 1
     assert lbls0 == lbls1                    # the object keeps one label through Z
 
-# NOTE: a "non-overlapping objects get distinct labels" test was intentionally NOT added:
-# at stitch_threshold=0.0, match_masks_3d keeps two zero-overlap objects that share an input
-# label as the SAME label rather than relabeling them apart. That relabeling semantic is a
-# quirk worth pinning down with a dedicated characterization test — see docs/TODO.md.
+def _plane_ids_collide():
+    """Two unrelated cells on planes 0 and 2, an empty plane between, both with per-plane id 1."""
+    m = np.zeros((3, 10, 10), dtype=np.int32)
+    m[0, 1:3, 1:3] = 1
+    m[2, 7:9, 7:9] = 1
+    return m
+
+
+def test_match_masks_3d_empty_plane_does_not_reuse_ids():
+    # Plane 1 is empty, so plane 2 has nothing to match against. Its raw per-plane id 1 used to
+    # survive and collide with plane 0's cell 1: two cells, one label, centroid in the gap.
+    matched = match_masks_3d(_plane_ids_collide(), stitch_threshold=0.0)
+    assert matched[0, 1, 1] != matched[2, 7, 7]
+    assert (matched > 0).sum() == (_plane_ids_collide() > 0).sum()
+
+
+def test_match_masks_3d_zero_overlap_objects_get_distinct_labels():
+    # Same input id on ADJACENT planes but no overlap: not a match, so two labels.
+    m = np.zeros((2, 10, 10), dtype=np.int32)
+    m[0, 1:3, 1:3] = 1
+    m[1, 7:9, 7:9] = 1
+    matched = match_masks_3d(m, stitch_threshold=0.0, gap_tolerance=0)
+    assert matched[0, 1, 1] != matched[1, 7, 7]
+
+
+def test_match_masks_3d_bridges_the_same_cell_across_an_empty_plane():
+    # The fresh id given after an empty plane must not stop the gap bridge reconnecting a real cell.
+    m = np.zeros((3, 10, 10), dtype=np.int32)
+    m[0, 2:6, 2:6] = 1
+    m[2, 2:6, 2:6] = 1
+    matched = match_masks_3d(m, stitch_threshold=0.0, gap_tolerance=1)
+    assert matched[0, 3, 3] == matched[2, 3, 3] != 0
+
+
+def test_match_masks_3d_bridge_leaves_a_continuing_chain_whole():
+    # A ends at plane 1. B runs planes 1-4 and widens over A's footprint from plane 3. The bridge
+    # from A (plane 1) to plane 3 must not take B's tail: B never broke, so it stays one label.
+    m = np.zeros((5, 12, 12), dtype=np.int32)
+    m[0:2, 1:5, 1:5] = 1
+    m[1:3, 1:5, 6:10] = 2
+    m[3:5, 1:5, 1:10] = 2
+    matched = match_masks_3d(m, stitch_threshold=0.0, gap_tolerance=1)
+    b = {int(matched[z, 2, 7]) for z in range(1, 5)}
+    assert len(b) == 1
+    assert matched[0, 2, 2] not in b

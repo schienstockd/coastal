@@ -228,6 +228,12 @@ labels across Z by sparse IOU overlap, then bridges chains broken by ≤ `gap_to
 (`_bridge_label_gaps`). `intersection_over_union` builds the sparse overlap matrix;
 `filter_small_cells(instances_4d, min_voxels)` drops sub-threshold labels per timepoint.
 
+One label is one object. A plane with no overlap to the one above (including after an empty plane)
+has nothing to match, so its labels get fresh ids; keeping the raw per-plane ids reused ids from the
+planes above, which merged two unrelated cells into one label with its centroid between them. The bridge only reconnects a chain that
+**starts** after the gap; a chain that runs straight through the gap is left whole. Both are pinned
+in `tests/test_utils.py`.
+
 ### The foreground is speckle, and it is the real bottleneck
 
 The prob head resolves cells, but sits on a 1–3 px noise floor that also crosses

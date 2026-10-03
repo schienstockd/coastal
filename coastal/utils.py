@@ -64,12 +64,13 @@ def _bridge_label_gaps(masks_list, gap_tolerance, iou_threshold):
 
     Z = len(masks_list)
 
-    # Find last Z-slice for each label
-    label_last_z = {}
+    # First and last Z-slice for each label
+    label_first_z, label_last_z = {}, {}
     for z, mask in enumerate(masks_list):
         for lbl in np.unique(mask):
             if lbl == 0:
                 continue
+            label_first_z.setdefault(int(lbl), z)
             label_last_z[int(lbl)] = z
 
     # Group labels by their last z (only those ending before the final slice)
@@ -113,6 +114,11 @@ def _bridge_label_gaps(masks_list, gap_tolerance, iou_threshold):
                 iou = np.where(union > 0, overlap / union, 0.0)
             iou[0, :] = 0.0  # ignore background row/col
             iou[:, 0] = 0.0
+            # Only a chain that STARTS at z_target can resume the broken one. A chain already
+            # running through the gap is its own object; renaming its tail split it in two and
+            # glued the tail onto the label that ended.
+            starts_here = np.array([label_first_z.get(j) == z_target for j in range(n_tgt)])
+            iou[:, ~starts_here] = 0.0
 
             claimed = set()
             bridged = set()
@@ -167,6 +173,18 @@ def match_masks_3d(masks_3d, stitch_threshold=0.0, gap_tolerance=1, gap_iou_thre
         iou = intersection_over_union(masks_list[i + 1], masks_list[i])[1:, 1:]
 
         if not iou.size:
+            # Nothing on plane i+1 overlaps plane i (`size` of a sparse matrix counts stored entries,
+            # so this is "no overlap", not only "plane i is empty"). Every label on i+1 then starts
+            # a new object. Keeping its raw per-plane ids reused ids the planes above already hold:
+            # two unrelated cells came back as ONE label. cellpose's stitch3D has the same hole, but
+            # only across an empty plane (its IoU matrix is dense).
+            nxt = masks_list[i + 1]
+            ids = np.unique(nxt[nxt > 0])
+            if ids.size:
+                lut = np.zeros(int(nxt.max()) + 1, dtype=nxt.dtype)
+                lut[ids] = np.arange(mmax + 1, mmax + ids.size + 1)
+                masks_list[i + 1] = lut[nxt]
+                mmax += ids.size
             continue
 
         n_next = iou.shape[0]  # cells in slice i+1

@@ -1,0 +1,16 @@
+# Dependabot version updates: GitHub Actions only. Python deps need no refresher here — ci.yml
+# installs unpinned from pyproject.toml, so CI always tests the latest releases. pixi.lock is the
+# local dev env only, and it path-sources the sibling cecelia checkout, so a CI job can't re-solve
+# it; run `pixi update` by hand. The shipped resolve of coastal's deps lives in cecelia's pixi.lock
+# (refreshed by cecelia's update-deps.yml).
+#
+# Monthly + grouped to match cecelia's .github/dependabot.yml.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
